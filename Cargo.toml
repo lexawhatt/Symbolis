@@ -1,0 +1,12 @@
+[package]
+name = "symbolis"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arboard = { version = "3.4", features = ["wayland-data-control"] }
+dirs = "5.0"
+eframe = "0.29"
+png = "0.18"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
