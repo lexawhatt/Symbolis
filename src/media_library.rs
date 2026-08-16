@@ -208,6 +208,23 @@ pub(crate) fn save_media_index(path: Option<&Path>, items: &[MediaItem]) -> io::
     write_json(path, items)
 }
 
+pub(crate) fn load_media_index(path: Option<&Path>) -> Vec<MediaItem> {
+    let Some(path) = path else {
+        return Vec::new();
+    };
+    let Ok(content) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(items) = serde_json::from_str::<Vec<MediaItem>>(&content) else {
+        return Vec::new();
+    };
+
+    items
+        .into_iter()
+        .filter(|item| item.path.exists())
+        .collect()
+}
+
 pub(crate) fn save_media_as_webm(item: &MediaItem) -> Result<PathBuf, MediaTranscodeError> {
     if !matches!(item.format, MediaFormat::Gif | MediaFormat::Mp4) {
         return Err(MediaTranscodeError::UnsupportedFormat(item.format));
@@ -321,10 +338,11 @@ fn export_video_to_gif(item: &MediaItem) -> Result<PathBuf, MediaTranscodeError>
 
 pub(crate) fn scan_media_library(paths: &[PathBuf]) -> Vec<MediaItem> {
     let mut items = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen_dirs = HashSet::new();
+    let mut seen_files = HashSet::new();
 
     for path in paths {
-        scan_path(path, &mut seen, &mut items);
+        scan_path(path, &mut seen_dirs, &mut seen_files, &mut items);
     }
 
     items.sort_by(|a, b| {
@@ -347,13 +365,31 @@ pub(crate) fn normalize_import_path(path: &Path) -> Option<PathBuf> {
     Some(fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
 }
 
-fn scan_path(path: &Path, seen: &mut HashSet<PathBuf>, items: &mut Vec<MediaItem>) {
-    if path.is_file() {
+fn scan_path(
+    path: &Path,
+    seen_dirs: &mut HashSet<PathBuf>,
+    seen_files: &mut HashSet<PathBuf>,
+    items: &mut Vec<MediaItem>,
+) {
+    let Ok(metadata) = fs::metadata(path) else {
+        return;
+    };
+
+    if metadata.is_file() {
         if let Ok(Some(item)) = MediaItem::from_path(path)
-            && seen.insert(item.path.clone())
+            && seen_files.insert(item.path.clone())
         {
             items.push(item);
         }
+        return;
+    }
+
+    if !metadata.is_dir() {
+        return;
+    }
+
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !seen_dirs.insert(canonical) {
         return;
     }
 
@@ -363,13 +399,7 @@ fn scan_path(path: &Path, seen: &mut HashSet<PathBuf>, items: &mut Vec<MediaItem
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
-            scan_path(&path, seen, items);
-        } else if let Ok(Some(item)) = MediaItem::from_path(&path)
-            && seen.insert(item.path.clone())
-        {
-            items.push(item);
-        }
+        scan_path(&path, seen_dirs, seen_files, items);
     }
 }
 
@@ -707,6 +737,54 @@ mod tests {
         assert!(items.iter().any(|item| item.title == "reaction"));
         assert!(items.iter().any(|item| item.title == "clip"));
         assert!(items.iter().any(|item| item.title == "sticker"));
+    }
+
+    #[test]
+    fn media_index_round_trip_filters_missing_files() {
+        let root = unique_test_dir();
+        fs::create_dir_all(&root).unwrap();
+        let media = root.join("reaction.gif");
+        let missing = root.join("missing.gif");
+        fs::write(&media, b"gif").unwrap();
+        let items = vec![
+            MediaItem::from_path(&media).unwrap().unwrap(),
+            MediaItem {
+                id: "missing".to_owned(),
+                title: "missing".to_owned(),
+                path: missing,
+                kind: MediaKind::Gif,
+                format: MediaFormat::Gif,
+                size_bytes: 0,
+                modified_at: 0,
+                search_text: String::new(),
+            },
+        ];
+        let index = root.join("index.json");
+
+        save_media_index(Some(&index), &items).unwrap();
+        let loaded = load_media_index(Some(&index));
+
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].title, "reaction");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_skips_symlink_directory_cycles() {
+        let root = unique_test_dir();
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("reaction.gif"), b"gif").unwrap();
+        std::os::unix::fs::symlink(&root, nested.join("back-to-root")).unwrap();
+
+        let items = scan_media_library(std::slice::from_ref(&root));
+
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "reaction");
     }
 
     #[test]

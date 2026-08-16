@@ -5,7 +5,10 @@ use eframe::egui::{
 };
 
 use crate::{
-    app::{ContentMode, MediaView, SymbolisApp, Tab, has_hovered_files, hovered_media_drop_count},
+    app::{
+        ContentMode, MediaItemSource, MediaView, SymbolisApp, Tab, has_hovered_files,
+        hovered_media_drop_count,
+    },
     data::{Category, DataSource, EmojiGroup, Entry},
     gif_provider::{GifProvider, ProviderStatus},
     media_drag::DragOutBackend,
@@ -182,13 +185,24 @@ impl SidebarGroup {
 impl SymbolisApp {
     pub(crate) fn draw(&mut self, ctx: &Context) {
         let chrome = chrome(self.settings.interface_mode);
-        let count = if self.selected_tab == Tab::Settings {
-            0
+        let filtered_entries =
+            if self.selected_tab != Tab::Settings && self.content_mode == ContentMode::Symbols {
+                Some(self.filtered_entry_indices())
+            } else {
+                None
+            };
+        let filtered_media =
+            if self.selected_tab != Tab::Settings && self.content_mode == ContentMode::Gifs {
+                Some(self.filtered_media_sources())
+            } else {
+                None
+            };
+        let count = if let Some(filtered) = &filtered_entries {
+            filtered.len()
+        } else if let Some(filtered) = &filtered_media {
+            filtered.len()
         } else {
-            match self.content_mode {
-                ContentMode::Symbols => self.filtered_entries().len(),
-                ContentMode::Gifs => self.filtered_media_items().len(),
-            }
+            0
         };
 
         self.draw_sidebar(ctx);
@@ -205,19 +219,25 @@ impl SymbolisApp {
 
                 match self.content_mode {
                     ContentMode::Symbols => {
-                        let filtered = self.filtered_entries();
+                        let filtered = filtered_entries.as_deref().unwrap_or(&[]);
                         if filtered.is_empty() {
                             draw_empty_state(ui, self, "No matches");
                             return;
                         }
 
                         ui.add_space(chrome.content_top_space);
-                        draw_symbol_grid(ui, self, &filtered);
+                        draw_symbol_grid(ui, self, filtered);
                     }
                     ContentMode::Gifs => {
-                        let filtered = self.filtered_media_items();
+                        let filtered = filtered_media.as_deref().unwrap_or(&[]);
                         if filtered.is_empty() {
                             let message = match self.media_view {
+                                MediaView::Library
+                                    if self.media_items.is_empty()
+                                        && self.media_scan_in_progress() =>
+                                {
+                                    "Indexing media library..."
+                                }
                                 MediaView::Library if self.media_items.is_empty() => {
                                     "Drop GIFs, MP4, or WebM here"
                                 }
@@ -230,7 +250,7 @@ impl SymbolisApp {
                         }
 
                         ui.add_space(chrome.content_top_space);
-                        draw_media_grid(ui, self, &filtered);
+                        draw_media_grid(ui, self, filtered);
                     }
                 }
             });
@@ -1267,7 +1287,7 @@ fn draw_empty_state(ui: &mut egui::Ui, app: &SymbolisApp, message: &str) {
     });
 }
 
-fn draw_symbol_grid(ui: &mut egui::Ui, app: &mut SymbolisApp, filtered: &[Entry]) {
+fn draw_symbol_grid(ui: &mut egui::Ui, app: &mut SymbolisApp, filtered: &[usize]) {
     let chrome = chrome(app.settings.interface_mode);
     let modern = app.settings.interface_mode.is_modern();
     let available_width = ui.available_width().max(1.0) - chrome.grid_side_padding * 2.0;
@@ -1297,9 +1317,12 @@ fn draw_symbol_grid(ui: &mut egui::Ui, app: &mut SymbolisApp, filtered: &[Entry]
                     ui.add_space(chrome.grid_side_padding);
                     ui.spacing_mut().item_spacing.x = chrome.tile_gap;
 
-                    for entry in &filtered[start..end] {
-                        if draw_symbol_tile(ui, app, entry, tile_width).clicked() {
-                            app.copy_entry(entry);
+                    for index in &filtered[start..end] {
+                        let Some(entry) = app.entry_at_active_index(*index) else {
+                            continue;
+                        };
+                        if draw_symbol_tile(ui, app, &entry, tile_width).clicked() {
+                            app.copy_entry(&entry);
                         }
                     }
                 });
@@ -1308,7 +1331,7 @@ fn draw_symbol_grid(ui: &mut egui::Ui, app: &mut SymbolisApp, filtered: &[Entry]
         });
 }
 
-fn draw_media_grid(ui: &mut egui::Ui, app: &mut SymbolisApp, filtered: &[MediaItem]) {
+fn draw_media_grid(ui: &mut egui::Ui, app: &mut SymbolisApp, filtered: &[MediaItemSource]) {
     let chrome = chrome(app.settings.interface_mode);
     let available_width = ui.available_width().max(1.0) - chrome.grid_side_padding * 2.0;
     let preferred_width = if app.settings.interface_mode.is_modern() {
@@ -1336,27 +1359,30 @@ fn draw_media_grid(ui: &mut egui::Ui, app: &mut SymbolisApp, filtered: &[MediaIt
                     ui.add_space(chrome.grid_side_padding);
                     ui.spacing_mut().item_spacing.x = chrome.tile_gap;
 
-                    for item in &filtered[start..end] {
-                        let response = draw_media_tile(ui, app, item, tile_width);
+                    for source in &filtered[start..end] {
+                        let Some(item) = app.media_item_from_source(*source) else {
+                            continue;
+                        };
+                        let response = draw_media_tile(ui, app, &item, tile_width);
                         if response.clicked() {
                             let favorite_clicked =
                                 response.interact_pointer_pos().is_some_and(|pos| {
                                     media_favorite_rect(response.rect).contains(pos)
                                 });
                             if favorite_clicked {
-                                app.toggle_media_favorite(item);
+                                app.toggle_media_favorite(&item);
                             } else {
-                                app.copy_media_file(item);
+                                app.copy_media_file(&item);
                             }
                         }
                         response.context_menu(|ui| {
-                            let favorite_label = if app.is_media_favorite(item) {
+                            let favorite_label = if app.is_media_favorite(&item) {
                                 "Remove favorite"
                             } else {
                                 "Add favorite"
                             };
                             if ui.button(favorite_label).clicked() {
-                                app.toggle_media_favorite(item);
+                                app.toggle_media_favorite(&item);
                                 ui.close_menu();
                             }
                             if ui
@@ -1369,15 +1395,15 @@ fn draw_media_grid(ui: &mut egui::Ui, app: &mut SymbolisApp, filtered: &[MediaIt
                                 )
                                 .clicked()
                             {
-                                app.save_optimized_media_copy(item);
+                                app.save_optimized_media_copy(&item);
                                 ui.close_menu();
                             }
                             if ui.button("Copy file").clicked() {
-                                app.copy_media_file(item);
+                                app.copy_media_file(&item);
                                 ui.close_menu();
                             }
                             if ui.button("Copy path").clicked() {
-                                app.copy_media_path(item);
+                                app.copy_media_path(&item);
                                 ui.close_menu();
                             }
                             if ui
@@ -1387,11 +1413,11 @@ fn draw_media_grid(ui: &mut egui::Ui, app: &mut SymbolisApp, filtered: &[MediaIt
                                 )
                                 .clicked()
                             {
-                                app.drag_media_file(item);
+                                app.drag_media_file(&item);
                                 ui.close_menu();
                             }
                             if ui.button("Open location").clicked() {
-                                app.open_media_location(item);
+                                app.open_media_location(&item);
                                 ui.close_menu();
                             }
                             ui.separator();
@@ -1403,7 +1429,7 @@ fn draw_media_grid(ui: &mut egui::Ui, app: &mut SymbolisApp, filtered: &[MediaIt
                                 .on_hover_text("Deletes this media file from disk")
                                 .clicked()
                             {
-                                app.delete_media_file(item);
+                                app.delete_media_file(&item);
                                 ui.close_menu();
                             }
                         });

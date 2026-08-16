@@ -16,10 +16,10 @@ use crate::{
     media_drag::{DragOutBackend, DragPreview, LinuxDragOutBackend},
     media_library::{
         MediaFormat, MediaItem, default_media_paths, export_media_for_transfer,
-        favorite_media_path, is_supported_media_path, load_favorite_media_ids, load_recent_media,
-        media_index_path, normalize_import_path, recent_media_path, save_favorite_media_ids,
-        save_media_as_webm, save_media_index, save_recent_media, scan_media_library,
-        store_media_file_for_library,
+        favorite_media_path, is_supported_media_path, load_favorite_media_ids, load_media_index,
+        load_recent_media, media_index_path, normalize_import_path, recent_media_path,
+        save_favorite_media_ids, save_media_as_webm, save_media_index, save_recent_media,
+        scan_media_library, store_media_file_for_library,
     },
     media_preview::MediaPreviewCache,
     preflight::{PreflightReport, StartupWarning},
@@ -62,6 +62,22 @@ enum MediaJobResult {
     },
 }
 
+enum MediaScanRequest {
+    Scan {
+        generation: u64,
+        paths: Vec<PathBuf>,
+        index_path: Option<PathBuf>,
+    },
+}
+
+enum MediaScanResult {
+    Complete {
+        generation: u64,
+        items: Vec<MediaItem>,
+        index_save_error: Option<String>,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ContentMode {
     Symbols,
@@ -84,6 +100,12 @@ pub(crate) enum MediaView {
     Library,
     Favorites,
     RecentlyUsed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MediaItemSource {
+    Library(usize),
+    Recent(usize),
 }
 
 impl MediaView {
@@ -152,10 +174,17 @@ pub(crate) struct SymbolisApp {
     media_job_tx: Sender<MediaJobRequest>,
     media_job_rx: Receiver<MediaJobResult>,
     active_media_jobs: usize,
+    media_scan_tx: Sender<MediaScanRequest>,
+    media_scan_rx: Receiver<MediaScanResult>,
+    active_media_scans: usize,
+    media_scan_generation: u64,
 }
 
 impl SymbolisApp {
-    pub(crate) fn new(cc: &eframe::CreationContext<'_>, preflight: PreflightReport) -> Self {
+    pub(crate) fn new(
+        cc: &eframe::CreationContext<'_>,
+        preflight: PreflightReport,
+    ) -> Result<Self, String> {
         configure_fonts(&cc.egui_ctx);
 
         let settings_path = settings_path();
@@ -176,13 +205,13 @@ impl SymbolisApp {
         let favorite_media_path = favorite_media_path();
         let favorite_media_ids = load_favorite_media_ids(favorite_media_path.as_deref());
         let media_index_path = media_index_path();
-        let media_items = scan_media_library(&media_scan_paths(&settings.gif_import_paths));
-        if let Err(err) = save_media_index(media_index_path.as_deref(), &media_items) {
-            eprintln!("failed to save media index: {err}");
-        }
+        let media_items = load_media_index(media_index_path.as_deref());
         let (media_job_tx, media_job_rx) = spawn_media_worker();
+        let (media_scan_tx, media_scan_rx) = spawn_media_scan_worker();
+        let clipboard = MediaClipboard::new()
+            .map_err(|err| format!("Clipboard backend became unavailable: {err}"))?;
 
-        Self {
+        let mut app = Self {
             entries,
             recent,
             media_items,
@@ -199,7 +228,7 @@ impl SymbolisApp {
             favorite_media_path,
             media_index_path,
             settings_path,
-            clipboard: MediaClipboard::new().expect("clipboard was verified by startup preflight"),
+            clipboard,
             drag_out: LinuxDragOutBackend::new(preflight.linux_session, preflight.drag_helper),
             status: None,
             startup_warnings: preflight.warnings,
@@ -210,42 +239,71 @@ impl SymbolisApp {
             media_job_tx,
             media_job_rx,
             active_media_jobs: 0,
-        }
+            media_scan_tx,
+            media_scan_rx,
+            active_media_scans: 0,
+            media_scan_generation: 0,
+        };
+        app.reload_media_library();
+        Ok(app)
     }
 
-    pub(crate) fn filtered_entries(&self) -> Vec<Entry> {
+    pub(crate) fn filtered_entry_indices(&self) -> Vec<usize> {
         let query = self.query.trim().to_lowercase();
 
         self.active_entries()
             .iter()
+            .enumerate()
             .filter(|entry| match self.selected_tab {
                 Tab::Recent => true,
-                Tab::Category(category) => entry.category == category,
-                Tab::EmojiGroup(group) => entry.emoji_group == Some(group),
+                Tab::Category(category) => entry.1.category == category,
+                Tab::EmojiGroup(group) => entry.1.emoji_group == Some(group),
                 Tab::Settings => false,
             })
-            .filter(|entry| query.is_empty() || entry.search_text.contains(&query))
-            .cloned()
+            .filter(|(_, entry)| query.is_empty() || entry.search_text.contains(&query))
+            .map(|(index, _)| index)
             .collect()
     }
 
-    pub(crate) fn filtered_media_items(&self) -> Vec<MediaItem> {
+    pub(crate) fn entry_at_active_index(&self, index: usize) -> Option<Entry> {
+        self.active_entries().get(index).cloned()
+    }
+
+    pub(crate) fn filtered_media_sources(&self) -> Vec<MediaItemSource> {
         let query = self.gif_query.trim().to_lowercase();
-        let items: Vec<MediaItem> = match self.media_view {
-            MediaView::Library => self.media_items.clone(),
+
+        match self.media_view {
+            MediaView::Library => self
+                .media_items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| query.is_empty() || item.search_text.contains(&query))
+                .map(|(index, _)| MediaItemSource::Library(index))
+                .collect(),
             MediaView::Favorites => self
                 .media_items
                 .iter()
-                .filter(|item| self.is_media_favorite(item))
-                .cloned()
+                .enumerate()
+                .filter(|(_, item)| self.is_media_favorite(item))
+                .filter(|(_, item)| query.is_empty() || item.search_text.contains(&query))
+                .map(|(index, _)| MediaItemSource::Library(index))
                 .collect(),
-            MediaView::RecentlyUsed => self.recent_media.clone(),
-        };
+            MediaView::RecentlyUsed => self
+                .recent_media
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| query.is_empty() || item.search_text.contains(&query))
+                .map(|(index, _)| MediaItemSource::Recent(index))
+                .collect(),
+        }
+    }
 
-        items
-            .into_iter()
-            .filter(|item| query.is_empty() || item.search_text.contains(&query))
-            .collect()
+    pub(crate) fn media_item_from_source(&self, source: MediaItemSource) -> Option<MediaItem> {
+        match source {
+            MediaItemSource::Library(index) => self.media_items.get(index),
+            MediaItemSource::Recent(index) => self.recent_media.get(index),
+        }
+        .cloned()
     }
 
     pub(crate) fn copy_entry(&mut self, entry: &Entry) {
@@ -423,13 +481,13 @@ impl SymbolisApp {
             return;
         }
 
-        self.reload_media_library();
         self.content_mode = ContentMode::Gifs;
-        self.status = Some(if file_was_missing {
+        let status = if file_was_missing {
             format!("Removed missing media: {title}")
         } else {
             format!("Deleted media file: {title}")
-        });
+        };
+        self.queue_media_scan(format!("{status}; reindexing media library..."));
     }
 
     pub(crate) fn add_media_import_path(&mut self, path: PathBuf) {
@@ -494,9 +552,6 @@ impl SymbolisApp {
         if added > 0 {
             self.save_settings();
         }
-        if accepted > 0 {
-            self.reload_media_library();
-        }
         if accepted > 0 || queued > 0 {
             self.content_mode = ContentMode::Gifs;
             self.media_view = MediaView::Library;
@@ -508,9 +563,8 @@ impl SymbolisApp {
         };
         let mut status = if accepted > 0 {
             format!(
-                "Imported {accepted} {noun}{}; indexed {} files",
-                plural_suffix(accepted),
-                self.media_items.len()
+                "Imported {accepted} {noun}{}; indexing media library...",
+                plural_suffix(accepted)
             )
         } else {
             String::new()
@@ -529,7 +583,11 @@ impl SymbolisApp {
                 plural_suffix(rejected)
             ));
         }
-        self.status = Some(status);
+        if accepted > 0 {
+            self.queue_media_scan(status);
+        } else {
+            self.status = Some(status);
+        }
     }
 
     pub(crate) fn remove_media_import_path(&mut self, path: &std::path::Path) {
@@ -537,24 +595,11 @@ impl SymbolisApp {
             .gif_import_paths
             .retain(|existing| existing != path);
         self.save_settings();
-        self.reload_media_library();
+        self.queue_media_scan("Removed media source; indexing media library...");
     }
 
     pub(crate) fn reload_media_library(&mut self) {
-        self.media_items = scan_media_library(&media_scan_paths(&self.settings.gif_import_paths));
-        self.recent_media.retain(|item| item.path.exists());
-        if let Err(err) = self.save_recent_media() {
-            self.status = Some(format!("Recent media save error: {err}"));
-            return;
-        }
-        match save_media_index(self.media_index_path.as_deref(), &self.media_items) {
-            Ok(()) => {
-                self.status = Some(format!("Indexed {} media files", self.media_items.len()));
-            }
-            Err(err) => {
-                self.status = Some(format!("Media index save error: {err}"));
-            }
-        }
+        self.queue_media_scan("Indexing media library...");
     }
 
     pub(crate) fn clear_recent(&mut self) {
@@ -667,6 +712,23 @@ impl SymbolisApp {
         false
     }
 
+    fn queue_media_scan(&mut self, status: impl Into<String>) {
+        self.media_scan_generation = self.media_scan_generation.wrapping_add(1);
+        let request = MediaScanRequest::Scan {
+            generation: self.media_scan_generation,
+            paths: media_scan_paths(&self.settings.gif_import_paths),
+            index_path: self.media_index_path.clone(),
+        };
+        self.active_media_scans += 1;
+        if self.media_scan_tx.send(request).is_ok() {
+            self.status = Some(status.into());
+            return;
+        }
+
+        self.active_media_scans = self.active_media_scans.saturating_sub(1);
+        self.status = Some("Media scan worker is unavailable".to_owned());
+    }
+
     fn poll_media_jobs(&mut self) {
         let mut completed = 0;
 
@@ -680,17 +742,53 @@ impl SymbolisApp {
         }
     }
 
+    fn poll_media_scans(&mut self) {
+        let mut completed = 0;
+
+        while let Ok(result) = self.media_scan_rx.try_recv() {
+            completed += 1;
+            self.handle_media_scan_result(result);
+        }
+
+        if completed > 0 {
+            self.active_media_scans = self.active_media_scans.saturating_sub(completed);
+        }
+    }
+
+    fn handle_media_scan_result(&mut self, result: MediaScanResult) {
+        let MediaScanResult::Complete {
+            generation,
+            items,
+            index_save_error,
+        } = result;
+
+        if generation != self.media_scan_generation {
+            return;
+        }
+
+        self.media_items = items;
+        self.recent_media.retain(|item| item.path.exists());
+        if let Err(err) = self.save_recent_media() {
+            self.status = Some(format!("Recent media save error: {err}"));
+            return;
+        }
+
+        self.status = Some(if let Some(err) = index_save_error {
+            format!("Media index save error: {err}")
+        } else {
+            format!("Indexed {} media files", self.media_items.len())
+        });
+    }
+
     fn handle_media_job_result(&mut self, result: MediaJobResult) {
         match result {
             MediaJobResult::StoredImport { original, result } => match result {
                 Ok(path) => {
-                    self.reload_media_library();
                     self.content_mode = ContentMode::Gifs;
                     self.media_view = MediaView::Library;
-                    self.status = Some(format!(
-                        "Stored optimized media: {}; indexed {} files",
-                        media_path_label(&path),
-                        self.media_items.len()
+                    self.queue_media_scan(format!(
+                        "Stored optimized media: {}; indexing media library...",
+                        media_path_label(&path)
                     ));
                 }
                 Err(err) => {
@@ -699,10 +797,12 @@ impl SymbolisApp {
             },
             MediaJobResult::OptimizedCopy { title, result } => match result {
                 Ok(path) => {
-                    self.reload_media_library();
                     self.content_mode = ContentMode::Gifs;
                     self.media_view = MediaView::Library;
-                    self.status = Some(format!("Saved WebM copy: {}", path.display()));
+                    self.queue_media_scan(format!(
+                        "Saved WebM copy: {}; indexing media library...",
+                        path.display()
+                    ));
                 }
                 Err(err) => {
                     self.status = Some(format!("WebM save error for {title}: {err}"));
@@ -733,23 +833,26 @@ impl SymbolisApp {
             self.settings.gif_import_paths.push(path.clone());
             self.save_settings();
         }
-        self.reload_media_library();
         self.content_mode = ContentMode::Gifs;
         self.media_view = MediaView::Library;
-        self.status = Some(format!(
-            "Imported original: {}; storage warning: {err}",
+        self.queue_media_scan(format!(
+            "Imported original: {}; storage warning: {err}; indexing media library...",
             media_path_label(&path)
         ));
     }
 
     fn media_jobs_active(&self) -> bool {
-        self.active_media_jobs > 0
+        self.active_media_jobs > 0 || self.active_media_scans > 0
     }
 
     fn request_media_job_repaint(&self, ctx: &Context) {
         if self.media_jobs_active() {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
+    }
+
+    pub(crate) fn media_scan_in_progress(&self) -> bool {
+        self.active_media_scans > 0
     }
 
     fn handle_keyboard(&mut self, ctx: &Context) {
@@ -760,12 +863,20 @@ impl SymbolisApp {
         if ctx.input(|input| input.key_pressed(Key::Enter)) {
             match self.content_mode {
                 ContentMode::Symbols => {
-                    if let Some(entry) = self.filtered_entries().first().cloned() {
+                    if let Some(entry) = self
+                        .filtered_entry_indices()
+                        .first()
+                        .and_then(|index| self.entry_at_active_index(*index))
+                    {
                         self.copy_entry(&entry);
                     }
                 }
                 ContentMode::Gifs => {
-                    if let Some(item) = self.filtered_media_items().first().cloned() {
+                    if let Some(item) = self
+                        .filtered_media_sources()
+                        .first()
+                        .and_then(|source| self.media_item_from_source(*source))
+                    {
                         self.copy_media_file(&item);
                     }
                 }
@@ -829,6 +940,21 @@ fn spawn_media_worker() -> (Sender<MediaJobRequest>, Receiver<MediaJobResult>) {
     (job_tx, result_rx)
 }
 
+fn spawn_media_scan_worker() -> (Sender<MediaScanRequest>, Receiver<MediaScanResult>) {
+    let (scan_tx, scan_rx) = mpsc::channel::<MediaScanRequest>();
+    let (result_tx, result_rx) = mpsc::channel::<MediaScanResult>();
+
+    thread::spawn(move || {
+        while let Ok(request) = scan_rx.recv() {
+            if result_tx.send(run_media_scan(request)).is_err() {
+                break;
+            }
+        }
+    });
+
+    (scan_tx, result_rx)
+}
+
 fn run_media_job(job: MediaJobRequest) -> MediaJobResult {
     match job {
         MediaJobRequest::StoredImport { original } => {
@@ -846,6 +972,26 @@ fn run_media_job(job: MediaJobRequest) -> MediaJobResult {
         MediaJobRequest::ExportForDrag { item } => {
             let result = export_media_for_transfer(&item).map_err(|err| err.to_string());
             MediaJobResult::ExportForDrag { item, result }
+        }
+    }
+}
+
+fn run_media_scan(request: MediaScanRequest) -> MediaScanResult {
+    match request {
+        MediaScanRequest::Scan {
+            generation,
+            paths,
+            index_path,
+        } => {
+            let items = scan_media_library(&paths);
+            let index_save_error = save_media_index(index_path.as_deref(), &items)
+                .err()
+                .map(|err| err.to_string());
+            MediaScanResult::Complete {
+                generation,
+                items,
+                index_save_error,
+            }
         }
     }
 }
@@ -881,6 +1027,7 @@ impl eframe::App for SymbolisApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         configure_style(ctx, &self.settings);
         self.poll_media_jobs();
+        self.poll_media_scans();
         self.request_media_job_repaint(ctx);
         self.handle_dropped_media(ctx);
         self.handle_keyboard(ctx);

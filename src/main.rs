@@ -34,7 +34,10 @@ fn main() -> eframe::Result {
     eframe::run_native(
         APP_NAME,
         options,
-        Box::new(|cc| Ok(Box::new(SymbolisApp::new(cc, preflight)))),
+        Box::new(|cc| match SymbolisApp::new(cc, preflight) {
+            Ok(app) => Ok(Box::new(app)),
+            Err(message) => Ok(Box::new(StartupErrorApp { message })),
+        }),
     )
 }
 

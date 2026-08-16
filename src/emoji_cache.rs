@@ -1,9 +1,12 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     io::BufReader,
     path::{Path, PathBuf},
     process::Command,
+    sync::mpsc::{self, Receiver, Sender},
+    thread,
+    time::Duration,
 };
 
 #[cfg(unix)]
@@ -20,14 +23,34 @@ pub(crate) struct EmojiCache {
     dir: Option<PathBuf>,
     color_renderer_available: bool,
     textures: HashMap<String, CachedEmoji>,
+    in_flight: HashSet<String>,
+    job_tx: Sender<EmojiJobRequest>,
+    result_rx: Receiver<EmojiJobResult>,
+}
+
+enum EmojiJobRequest {
+    Render {
+        key: String,
+        emoji: String,
+        output: PathBuf,
+    },
+}
+
+enum EmojiJobResult {
+    Ready { key: String, path: PathBuf },
+    Failed { key: String },
 }
 
 impl EmojiCache {
     pub(crate) fn new(color_renderer_available: bool) -> Self {
+        let (job_tx, result_rx) = spawn_emoji_worker();
         Self {
             dir: dirs::cache_dir().map(|dir| dir.join("symbolis").join("emoji")),
             color_renderer_available,
             textures: HashMap::new(),
+            in_flight: HashSet::new(),
+            job_tx,
+            result_rx,
         }
     }
 
@@ -36,13 +59,20 @@ impl EmojiCache {
     }
 
     pub(crate) fn texture(&mut self, ctx: &Context, emoji: &str) -> Option<&TextureHandle> {
+        self.drain_completed(ctx);
+
         let key = cache_key(emoji);
         if !self.textures.contains_key(&key) {
-            let cached = self
-                .render_or_load(ctx, emoji, &key)
-                .map(CachedEmoji::Ready)
-                .unwrap_or(CachedEmoji::Failed);
-            self.textures.insert(key.clone(), cached);
+            if let Some(texture) = self.load_cached_texture(ctx, &key) {
+                self.textures
+                    .insert(key.clone(), CachedEmoji::Ready(texture));
+            } else {
+                self.queue_render_job(&key, emoji);
+            }
+        }
+
+        if self.in_flight.contains(&key) {
+            ctx.request_repaint_after(Duration::from_millis(80));
         }
 
         match self.textures.get(&key) {
@@ -51,35 +81,122 @@ impl EmojiCache {
         }
     }
 
-    fn render_or_load(&self, ctx: &Context, emoji: &str, key: &str) -> Option<TextureHandle> {
+    fn drain_completed(&mut self, ctx: &Context) {
+        let mut updated = false;
+
+        while let Ok(result) = self.result_rx.try_recv() {
+            match result {
+                EmojiJobResult::Ready { key, path } => {
+                    self.in_flight.remove(&key);
+                    let cached = load_texture(ctx, &key, &path)
+                        .map(CachedEmoji::Ready)
+                        .unwrap_or(CachedEmoji::Failed);
+                    self.textures.insert(key, cached);
+                }
+                EmojiJobResult::Failed { key } => {
+                    self.in_flight.remove(&key);
+                    self.textures.insert(key, CachedEmoji::Failed);
+                }
+            }
+            updated = true;
+        }
+
+        if updated {
+            ctx.request_repaint();
+        }
+    }
+
+    fn load_cached_texture(&self, ctx: &Context, key: &str) -> Option<TextureHandle> {
+        let path = self.cached_png_path(key)?;
+        if !path.exists() {
+            return None;
+        }
+        load_texture(ctx, key, &path)
+    }
+
+    fn queue_render_job(&mut self, key: &str, emoji: &str) {
+        if self.in_flight.contains(key) {
+            return;
+        }
+
+        if !self.color_renderer_available {
+            self.textures.insert(key.to_owned(), CachedEmoji::Failed);
+            return;
+        }
+
+        let Some(output) = self.cached_png_path(key) else {
+            self.textures.insert(key.to_owned(), CachedEmoji::Failed);
+            return;
+        };
+
+        let key = key.to_owned();
+        self.in_flight.insert(key.clone());
+        let request = EmojiJobRequest::Render {
+            key: key.clone(),
+            emoji: emoji.to_owned(),
+            output,
+        };
+        if self.job_tx.send(request).is_err() {
+            self.in_flight.remove(key.as_str());
+            self.textures.insert(key, CachedEmoji::Failed);
+        }
+    }
+
+    fn cached_png_path(&self, key: &str) -> Option<PathBuf> {
         let dir = self.dir.as_ref()?;
         fs::create_dir_all(dir).ok()?;
-
-        let path = dir.join(format!("{key}.png"));
-        if !path.exists() && (!self.color_renderer_available || !render_emoji_png(emoji, &path)) {
-            return None;
-        }
-
-        let file = fs::File::open(path).ok()?;
-        let decoder = png::Decoder::new(BufReader::new(file));
-        let mut reader = decoder.read_info().ok()?;
-        let mut pixels = vec![0; reader.output_buffer_size()?];
-        let info = reader.next_frame(&mut pixels).ok()?;
-
-        if info.color_type != png::ColorType::Rgba {
-            return None;
-        }
-
-        let size = [info.width as usize, info.height as usize];
-        pixels.truncate(info.buffer_size());
-        let color_image = ColorImage::from_rgba_unmultiplied(size, &pixels);
-
-        Some(ctx.load_texture(
-            format!("symbolis-emoji-{key}"),
-            color_image,
-            TextureOptions::LINEAR,
-        ))
+        Some(dir.join(format!("{key}.png")))
     }
+}
+
+fn spawn_emoji_worker() -> (Sender<EmojiJobRequest>, Receiver<EmojiJobResult>) {
+    let (job_tx, job_rx) = mpsc::channel::<EmojiJobRequest>();
+    let (result_tx, result_rx) = mpsc::channel::<EmojiJobResult>();
+
+    thread::spawn(move || {
+        while let Ok(job) = job_rx.recv() {
+            if result_tx.send(run_emoji_job(job)).is_err() {
+                break;
+            }
+        }
+    });
+
+    (job_tx, result_rx)
+}
+
+fn run_emoji_job(job: EmojiJobRequest) -> EmojiJobResult {
+    match job {
+        EmojiJobRequest::Render { key, emoji, output } => {
+            if render_emoji_png(&emoji, &output) {
+                EmojiJobResult::Ready { key, path: output }
+            } else {
+                let _ = fs::remove_file(output);
+                EmojiJobResult::Failed { key }
+            }
+        }
+    }
+}
+
+fn load_texture(ctx: &Context, key: &str, path: &Path) -> Option<TextureHandle> {
+    let file = fs::File::open(path).ok()?;
+    let decoder = png::Decoder::new(BufReader::new(file));
+    let mut reader = decoder.read_info().ok()?;
+    let mut pixels = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut pixels).ok()?;
+
+    if info.color_type != png::ColorType::Rgba {
+        return None;
+    }
+
+    let size = [info.width as usize, info.height as usize];
+    pixels.truncate(info.buffer_size());
+    let color_image = ColorImage::from_rgba_unmultiplied(size, &pixels);
+
+    Some(ctx.load_texture(
+        format!("symbolis-emoji-{key}"),
+        color_image,
+        TextureOptions::LINEAR,
+    ))
 }
 
 pub(crate) fn detect_color_emoji_renderer() -> bool {
