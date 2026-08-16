@@ -274,10 +274,48 @@ impl UiSettings {
         }
     }
 
+    pub(crate) fn delete_selected_custom_theme(&mut self) -> bool {
+        let ThemeSelection::Custom(current_name) = self.theme.clone() else {
+            return false;
+        };
+
+        let Some(index) = self
+            .custom_themes
+            .iter()
+            .position(|theme| theme.name == current_name)
+        else {
+            self.apply_preset(self.fallback_preset());
+            return false;
+        };
+
+        self.custom_themes.remove(index);
+
+        if let Some(theme) = self.custom_themes.get(index).or_else(|| {
+            index
+                .checked_sub(1)
+                .and_then(|index| self.custom_themes.get(index))
+        }) {
+            self.theme = ThemeSelection::Custom(theme.name.clone());
+            self.palette = theme.palette;
+        } else {
+            self.apply_preset(self.fallback_preset());
+        }
+
+        true
+    }
+
     pub(crate) fn selected_custom_theme_name(&self) -> Option<&str> {
         match &self.theme {
             ThemeSelection::Custom(name) => Some(name.as_str()),
             ThemeSelection::Preset(_) => None,
+        }
+    }
+
+    fn fallback_preset(&self) -> Preset {
+        if self.preset == Preset::LegacyCustom {
+            Preset::ModernDark
+        } else {
+            self.preset
         }
     }
 
@@ -422,100 +460,6 @@ pub(crate) fn configure_fonts(ctx: &Context) {
     ctx.set_fonts(fonts);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn interface_mode_does_not_change_selected_theme_or_palette() {
-        let mut settings = UiSettings::from_preset(Preset::CatppuccinMocha);
-        let palette = settings.palette;
-
-        settings.apply_interface_mode(InterfaceMode::RawDev);
-
-        assert_eq!(
-            settings.theme,
-            ThemeSelection::Preset(Preset::CatppuccinMocha)
-        );
-        assert_eq!(settings.preset, Preset::CatppuccinMocha);
-        assert_eq!(settings.palette, palette);
-    }
-
-    #[test]
-    fn first_palette_edit_creates_one_named_custom_theme() {
-        let mut settings = UiSettings::from_preset(Preset::ModernDark);
-        settings.palette.accent = Rgb::new(1, 2, 3);
-
-        settings.ensure_editable_theme();
-
-        assert_eq!(settings.custom_themes.len(), 1);
-        assert_eq!(
-            settings.theme,
-            ThemeSelection::Custom("Custom 1".to_owned())
-        );
-        assert_eq!(settings.custom_themes[0].name, "Custom 1");
-        assert_eq!(settings.custom_themes[0].palette, settings.palette);
-    }
-
-    #[test]
-    fn editing_selected_custom_theme_updates_it_in_place() {
-        let mut settings = UiSettings::from_preset(Preset::ModernDark);
-        settings.palette.accent = Rgb::new(1, 2, 3);
-        settings.ensure_editable_theme();
-
-        settings.palette.accent = Rgb::new(4, 5, 6);
-        settings.ensure_editable_theme();
-
-        assert_eq!(settings.custom_themes.len(), 1);
-        assert_eq!(settings.custom_themes[0].palette, settings.palette);
-    }
-
-    #[test]
-    fn selected_custom_theme_can_be_renamed() {
-        let mut settings = UiSettings::from_preset(Preset::ModernDark);
-        settings.palette.accent = Rgb::new(1, 2, 3);
-        settings.ensure_editable_theme();
-
-        settings.rename_selected_custom_theme("My Theme".to_owned());
-
-        assert_eq!(
-            settings.theme,
-            ThemeSelection::Custom("My Theme".to_owned())
-        );
-        assert_eq!(settings.custom_themes[0].name, "My Theme");
-    }
-
-    #[test]
-    fn legacy_custom_preset_loads_as_named_theme() {
-        let mut settings = UiSettings::from_preset(Preset::ModernDark);
-        settings.preset = Preset::LegacyCustom;
-        settings.palette.accent = Rgb::new(9, 8, 7);
-
-        let mut value = serde_json::to_value(&settings).unwrap();
-        let object = value.as_object_mut().unwrap();
-        object.remove("theme");
-        object.remove("custom_themes");
-
-        let path = std::env::temp_dir().join(format!(
-            "symbolis-legacy-theme-{}-{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
-
-        let loaded = load_settings(&path).unwrap();
-        let _ = fs::remove_file(path);
-
-        assert_eq!(loaded.preset, Preset::ModernDark);
-        assert_eq!(loaded.theme, ThemeSelection::Custom("Custom 1".to_owned()));
-        assert_eq!(loaded.custom_themes.len(), 1);
-        assert_eq!(loaded.custom_themes[0].palette.accent, Rgb::new(9, 8, 7));
-    }
-}
-
 fn palette_for(preset: Preset) -> Palette {
     match preset {
         Preset::ModernDark => Palette {
@@ -606,5 +550,133 @@ fn palette_for(preset: Preset) -> Palette {
             muted: Rgb::new(70, 70, 70),
             danger: Rgb::new(190, 0, 0),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interface_mode_does_not_change_selected_theme_or_palette() {
+        let mut settings = UiSettings::from_preset(Preset::CatppuccinMocha);
+        let palette = settings.palette;
+
+        settings.apply_interface_mode(InterfaceMode::RawDev);
+
+        assert_eq!(
+            settings.theme,
+            ThemeSelection::Preset(Preset::CatppuccinMocha)
+        );
+        assert_eq!(settings.preset, Preset::CatppuccinMocha);
+        assert_eq!(settings.palette, palette);
+    }
+
+    #[test]
+    fn first_palette_edit_creates_one_named_custom_theme() {
+        let mut settings = UiSettings::from_preset(Preset::ModernDark);
+        settings.palette.accent = Rgb::new(1, 2, 3);
+
+        settings.ensure_editable_theme();
+
+        assert_eq!(settings.custom_themes.len(), 1);
+        assert_eq!(
+            settings.theme,
+            ThemeSelection::Custom("Custom 1".to_owned())
+        );
+        assert_eq!(settings.custom_themes[0].name, "Custom 1");
+        assert_eq!(settings.custom_themes[0].palette, settings.palette);
+    }
+
+    #[test]
+    fn editing_selected_custom_theme_updates_it_in_place() {
+        let mut settings = UiSettings::from_preset(Preset::ModernDark);
+        settings.palette.accent = Rgb::new(1, 2, 3);
+        settings.ensure_editable_theme();
+
+        settings.palette.accent = Rgb::new(4, 5, 6);
+        settings.ensure_editable_theme();
+
+        assert_eq!(settings.custom_themes.len(), 1);
+        assert_eq!(settings.custom_themes[0].palette, settings.palette);
+    }
+
+    #[test]
+    fn selected_custom_theme_can_be_renamed() {
+        let mut settings = UiSettings::from_preset(Preset::ModernDark);
+        settings.palette.accent = Rgb::new(1, 2, 3);
+        settings.ensure_editable_theme();
+
+        settings.rename_selected_custom_theme("My Theme".to_owned());
+
+        assert_eq!(
+            settings.theme,
+            ThemeSelection::Custom("My Theme".to_owned())
+        );
+        assert_eq!(settings.custom_themes[0].name, "My Theme");
+    }
+
+    #[test]
+    fn deleting_only_custom_theme_returns_to_fallback_preset() {
+        let mut settings = UiSettings::from_preset(Preset::CatppuccinMocha);
+        settings.palette.accent = Rgb::new(1, 2, 3);
+        settings.ensure_editable_theme();
+
+        assert!(settings.delete_selected_custom_theme());
+
+        assert!(settings.custom_themes.is_empty());
+        assert_eq!(
+            settings.theme,
+            ThemeSelection::Preset(Preset::CatppuccinMocha)
+        );
+        assert_eq!(settings.palette, palette_for(Preset::CatppuccinMocha));
+    }
+
+    #[test]
+    fn deleting_custom_theme_selects_neighbor_when_available() {
+        let mut settings = UiSettings::from_preset(Preset::ModernDark);
+        settings.palette.accent = Rgb::new(1, 2, 3);
+        settings.ensure_editable_theme();
+        settings.rename_selected_custom_theme("First".to_owned());
+        settings.apply_preset(Preset::DefaultGray);
+        settings.palette.accent = Rgb::new(4, 5, 6);
+        settings.ensure_editable_theme();
+        settings.rename_selected_custom_theme("Second".to_owned());
+
+        assert!(settings.delete_selected_custom_theme());
+
+        assert_eq!(settings.custom_themes.len(), 1);
+        assert_eq!(settings.theme, ThemeSelection::Custom("First".to_owned()));
+        assert_eq!(settings.custom_themes[0].name, "First");
+    }
+
+    #[test]
+    fn legacy_custom_preset_loads_as_named_theme() {
+        let mut settings = UiSettings::from_preset(Preset::ModernDark);
+        settings.preset = Preset::LegacyCustom;
+        settings.palette.accent = Rgb::new(9, 8, 7);
+
+        let mut value = serde_json::to_value(&settings).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("theme");
+        object.remove("custom_themes");
+
+        let path = std::env::temp_dir().join(format!(
+            "symbolis-legacy-theme-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+
+        let loaded = load_settings(&path).unwrap();
+        let _ = fs::remove_file(path);
+
+        assert_eq!(loaded.preset, Preset::ModernDark);
+        assert_eq!(loaded.theme, ThemeSelection::Custom("Custom 1".to_owned()));
+        assert_eq!(loaded.custom_themes.len(), 1);
+        assert_eq!(loaded.custom_themes[0].palette.accent, Rgb::new(9, 8, 7));
     }
 }

@@ -7,7 +7,7 @@ use crate::{
     emoji_cache::EmojiCache,
     media_clipboard::MediaClipboard,
     media_drag::{DragOutBackend, LinuxDragOutBackend},
-    preflight::PreflightReport,
+    preflight::{PreflightReport, StartupWarning},
     settings::{
         UiSettings, configure_fonts, configure_style, load_settings, save_settings, settings_path,
     },
@@ -53,6 +53,7 @@ pub(crate) struct SymbolisApp {
     pub(crate) clipboard: MediaClipboard,
     pub(crate) drag_out: LinuxDragOutBackend,
     pub(crate) status: Option<String>,
+    pub(crate) startup_warnings: Vec<StartupWarning>,
     pub(crate) data_source: DataSource,
     pub(crate) settings: UiSettings,
     pub(crate) emoji_cache: EmojiCache,
@@ -86,9 +87,10 @@ impl SymbolisApp {
             clipboard: MediaClipboard::new().expect("clipboard was verified by startup preflight"),
             drag_out: LinuxDragOutBackend::new(preflight.linux_session, preflight.drag_helper),
             status: None,
+            startup_warnings: preflight.warnings,
             data_source,
             settings,
-            emoji_cache: EmojiCache::new(),
+            emoji_cache: EmojiCache::new(preflight.color_emoji_renderer),
         }
     }
 
@@ -148,9 +150,17 @@ impl SymbolisApp {
         let drag = if self.drag_out.can_drag_files() {
             format!("drag ready via {}", self.drag_out.helper_label())
         } else {
-            "file clipboard ready".to_owned()
+            "drag disabled; clipboard ready".to_owned()
         };
         format!("{} delivery: {drag}", self.drag_out.session_label())
+    }
+
+    pub(crate) fn color_emoji_status(&self) -> &'static str {
+        if self.emoji_cache.color_renderer_available() {
+            "Color emoji: pango-view ready"
+        } else {
+            "Color emoji: fallback text renderer"
+        }
     }
 
     pub(crate) fn gif_provider_status(&self) -> String {
@@ -195,10 +205,10 @@ impl SymbolisApp {
             ctx.send_viewport_cmd(ViewportCommand::Close);
         }
 
-        if ctx.input(|input| input.key_pressed(Key::Enter)) {
-            if let Some(entry) = self.filtered_entries().first().cloned() {
-                self.copy_entry(&entry);
-            }
+        if ctx.input(|input| input.key_pressed(Key::Enter))
+            && let Some(entry) = self.filtered_entries().first().cloned()
+        {
+            self.copy_entry(&entry);
         }
     }
 }

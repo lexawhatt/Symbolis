@@ -242,12 +242,12 @@ pub(crate) enum DataSource {
 
 pub(crate) fn load_entries() -> (Vec<Entry>, DataSource) {
     for data_dir in candidate_data_dirs() {
-        if let Ok(mut entries) = load_entries_from_dir(&data_dir) {
-            if !entries.is_empty() {
-                entries.extend(curated_symbol_entries());
-                ensure_custom_kaomoji(&mut entries);
-                return (dedup_entries(entries), DataSource::Rofimoji(data_dir));
-            }
+        if let Ok(mut entries) = load_entries_from_dir(&data_dir)
+            && !entries.is_empty()
+        {
+            entries.extend(curated_symbol_entries());
+            ensure_custom_kaomoji(&mut entries);
+            return (dedup_entries(entries), DataSource::Rofimoji(data_dir));
         }
     }
 

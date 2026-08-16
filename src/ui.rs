@@ -401,6 +401,7 @@ impl SymbolisApp {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn sidebar_icon_button(
         &mut self,
         ui: &mut egui::Ui,
@@ -618,6 +619,18 @@ impl SymbolisApp {
                     );
 
                     ui.separator();
+                    let color = if self.emoji_cache.color_renderer_available() {
+                        self.settings.palette.muted.color()
+                    } else {
+                        self.settings.palette.danger.color()
+                    };
+                    ui.label(
+                        RichText::new(self.color_emoji_status())
+                            .size(12.0)
+                            .color(color),
+                    );
+
+                    ui.separator();
                     ui.label(
                         RichText::new(self.gif_provider_status())
                             .size(12.0)
@@ -735,6 +748,20 @@ impl SymbolisApp {
                                         self.settings.rename_selected_custom_theme(editable_name);
                                         changed = true;
                                     }
+                                    if ui
+                                        .add(
+                                            Button::new(
+                                                RichText::new("Delete")
+                                                    .color(self.settings.palette.danger.color()),
+                                            )
+                                            .fill(self.settings.palette.tile.color()),
+                                        )
+                                        .on_hover_text("Delete selected custom theme")
+                                        .clicked()
+                                    {
+                                        self.settings.delete_selected_custom_theme();
+                                        changed = true;
+                                    }
                                 });
                             }
 
@@ -789,6 +816,48 @@ impl SymbolisApp {
                                     .size(12.0)
                                     .color(status_color),
                             );
+                        });
+
+                        ui.add_space(12.0);
+                        settings_panel(ui, "System", self.settings.palette, |ui| {
+                            ui.label(
+                                RichText::new(self.delivery_status())
+                                    .size(12.0)
+                                    .color(self.settings.palette.muted.color()),
+                            );
+
+                            let color = if self.emoji_cache.color_renderer_available() {
+                                self.settings.palette.muted.color()
+                            } else {
+                                self.settings.palette.danger.color()
+                            };
+                            ui.label(
+                                RichText::new(self.color_emoji_status())
+                                    .size(12.0)
+                                    .color(color),
+                            );
+
+                            if !self.startup_warnings.is_empty() {
+                                ui.add_space(8.0);
+                            }
+
+                            for warning in &self.startup_warnings {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{}: {}",
+                                        warning.feature, warning.message
+                                    ))
+                                    .size(12.0)
+                                    .color(self.settings.palette.danger.color()),
+                                );
+                                if let Some(hint) = &warning.hint {
+                                    ui.label(
+                                        RichText::new(hint)
+                                            .size(12.0)
+                                            .color(self.settings.palette.muted.color()),
+                                    );
+                                }
+                            }
                         });
 
                         ui.add_space(12.0);

@@ -5,12 +5,17 @@ use std::{
 
 use arboard::Clipboard;
 
-use crate::media_drag::{LinuxDragHelper, detect_linux_drag_helper};
+use crate::{
+    emoji_cache::detect_color_emoji_renderer,
+    media_drag::{LinuxDragHelper, detect_linux_drag_helper},
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct PreflightReport {
     pub(crate) linux_session: LinuxSession,
-    pub(crate) drag_helper: LinuxDragHelper,
+    pub(crate) drag_helper: Option<LinuxDragHelper>,
+    pub(crate) color_emoji_renderer: bool,
+    pub(crate) warnings: Vec<StartupWarning>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -87,8 +92,26 @@ impl FailedCheck {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StartupWarning {
+    pub(crate) feature: &'static str,
+    pub(crate) message: String,
+    pub(crate) hint: Option<String>,
+}
+
+impl StartupWarning {
+    fn new(feature: &'static str, message: impl Into<String>, hint: impl Into<String>) -> Self {
+        Self {
+            feature,
+            message: message.into(),
+            hint: Some(hint.into()),
+        }
+    }
+}
+
 pub(crate) fn run_startup_preflight() -> Result<PreflightReport, PreflightError> {
     let mut failures = Vec::new();
+    let mut warnings = Vec::new();
 
     #[cfg(not(target_os = "linux"))]
     {
@@ -116,19 +139,25 @@ pub(crate) fn run_startup_preflight() -> Result<PreflightReport, PreflightError>
             ));
         }
 
-        let drag_helper = match detect_linux_drag_helper() {
-            Ok(helper) => Some(helper),
-            Err(err) => {
-                failures.push(FailedCheck::new(err.to_string(), err.install_hint()));
-                None
-            }
-        };
+        let drag_helper = detect_linux_drag_helper().map(Some).unwrap_or_else(|err| {
+            warnings.push(StartupWarning::new(
+                "Drag and drop",
+                err.to_string(),
+                err.install_hint(),
+            ));
+            None
+        });
+
+        let color_emoji_renderer = detect_color_emoji_renderer();
+        if !color_emoji_renderer {
+            warnings.push(StartupWarning::new(
+                "Color emoji",
+                "pango-view is missing; emoji will use the fallback text renderer.",
+                "Install pango tools, usually packaged as pango, pango-utils, or libpango1.0-bin depending on the distribution.",
+            ));
+        }
 
         let Some(linux_session) = session else {
-            return Err(PreflightError::new(failures));
-        };
-
-        let Some(drag_helper) = drag_helper else {
             return Err(PreflightError::new(failures));
         };
 
@@ -136,6 +165,8 @@ pub(crate) fn run_startup_preflight() -> Result<PreflightReport, PreflightError>
             Ok(PreflightReport {
                 linux_session,
                 drag_helper,
+                color_emoji_renderer,
+                warnings,
             })
         } else {
             Err(PreflightError::new(failures))

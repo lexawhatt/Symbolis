@@ -1,4 +1,13 @@
-use std::{collections::HashMap, fs, io::BufReader, path::PathBuf, process::Command};
+use std::{
+    collections::HashMap,
+    env, fs,
+    io::BufReader,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use eframe::egui::{ColorImage, Context, TextureHandle, TextureOptions};
 
@@ -9,15 +18,21 @@ enum CachedEmoji {
 
 pub(crate) struct EmojiCache {
     dir: Option<PathBuf>,
+    color_renderer_available: bool,
     textures: HashMap<String, CachedEmoji>,
 }
 
 impl EmojiCache {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(color_renderer_available: bool) -> Self {
         Self {
             dir: dirs::cache_dir().map(|dir| dir.join("symbolis").join("emoji")),
+            color_renderer_available,
             textures: HashMap::new(),
         }
+    }
+
+    pub(crate) fn color_renderer_available(&self) -> bool {
+        self.color_renderer_available
     }
 
     pub(crate) fn texture(&mut self, ctx: &Context, emoji: &str) -> Option<&TextureHandle> {
@@ -41,7 +56,7 @@ impl EmojiCache {
         fs::create_dir_all(dir).ok()?;
 
         let path = dir.join(format!("{key}.png"));
-        if !path.exists() && !render_emoji_png(emoji, &path) {
+        if !path.exists() && (!self.color_renderer_available || !render_emoji_png(emoji, &path)) {
             return None;
         }
 
@@ -67,7 +82,11 @@ impl EmojiCache {
     }
 }
 
-fn render_emoji_png(emoji: &str, path: &PathBuf) -> bool {
+pub(crate) fn detect_color_emoji_renderer() -> bool {
+    find_executable_in_path("pango-view").is_some()
+}
+
+fn render_emoji_png(emoji: &str, path: &Path) -> bool {
     Command::new("pango-view")
         .arg("--no-display")
         .arg("--font=Noto Color Emoji 42")
@@ -76,6 +95,35 @@ fn render_emoji_png(emoji: &str, path: &PathBuf) -> bool {
         .arg(format!("--text={emoji}"))
         .status()
         .is_ok_and(|status| status.success())
+}
+
+fn find_executable_in_path(name: &str) -> Option<PathBuf> {
+    env::var_os("PATH")?
+        .to_string_lossy()
+        .split(':')
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| Path::new(dir).join(name))
+        .find(|path| is_executable_file(path))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+
+    if !metadata.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode() & 0o111 != 0
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn cache_key(value: &str) -> String {

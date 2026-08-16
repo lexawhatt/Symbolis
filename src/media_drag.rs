@@ -54,11 +54,11 @@ pub(crate) trait DragOutBackend {
 
 pub(crate) struct LinuxDragOutBackend {
     session: LinuxSession,
-    helper: LinuxDragHelper,
+    helper: Option<LinuxDragHelper>,
 }
 
 impl LinuxDragOutBackend {
-    pub(crate) fn new(session: LinuxSession, helper: LinuxDragHelper) -> Self {
+    pub(crate) fn new(session: LinuxSession, helper: Option<LinuxDragHelper>) -> Self {
         Self { session, helper }
     }
 
@@ -67,13 +67,16 @@ impl LinuxDragOutBackend {
     }
 
     pub(crate) fn helper_label(&self) -> String {
-        self.helper.label()
+        self.helper
+            .as_ref()
+            .map(LinuxDragHelper::label)
+            .unwrap_or_else(|| "disabled".to_owned())
     }
 }
 
 impl DragOutBackend for LinuxDragOutBackend {
     fn can_drag_files(&self) -> bool {
-        true
+        self.helper.is_some()
     }
 
     fn begin_file_drag(
@@ -82,7 +85,12 @@ impl DragOutBackend for LinuxDragOutBackend {
         preview: DragPreview,
     ) -> Result<(), DragOutError> {
         validate_drag_files(files)?;
-        self.helper.launch(files, &preview)
+        let Some(helper) = &self.helper else {
+            return Err(DragOutError::Unsupported(
+                MissingDragHelper::default().install_hint(),
+            ));
+        };
+        helper.launch(files, &preview)
     }
 }
 
@@ -150,6 +158,17 @@ pub(crate) struct MissingDragHelper {
     searched: Vec<String>,
 }
 
+impl Default for MissingDragHelper {
+    fn default() -> Self {
+        Self {
+            searched: vec![
+                DRAGON_DROP_COMMAND.to_owned(),
+                format!("{DRAGON_COMMAND} (mwh/dragon compatible)"),
+            ],
+        }
+    }
+}
+
 impl MissingDragHelper {
     pub(crate) fn install_hint(&self) -> String {
         format!(
@@ -187,14 +206,14 @@ pub(crate) fn detect_linux_drag_helper() -> Result<LinuxDragHelper, MissingDragH
     }
     searched.push(DRAGON_DROP_COMMAND.to_owned());
 
-    if let Some(path) = find_executable_in_path(DRAGON_COMMAND) {
-        if looks_like_mwh_dragon(&path) {
-            searched.push(DRAGON_COMMAND.to_owned());
-            return Ok(LinuxDragHelper {
-                kind: LinuxDragHelperKind::Dragon,
-                command: path,
-            });
-        }
+    if let Some(path) = find_executable_in_path(DRAGON_COMMAND)
+        && looks_like_mwh_dragon(&path)
+    {
+        searched.push(DRAGON_COMMAND.to_owned());
+        return Ok(LinuxDragHelper {
+            kind: LinuxDragHelperKind::Dragon,
+            command: path,
+        });
     }
     searched.push(format!("{DRAGON_COMMAND} (mwh/dragon compatible)"));
 
@@ -300,5 +319,25 @@ mod tests {
             command: PathBuf::from("/tmp/dragon-drop"),
         };
         assert_eq!(helper.kind, LinuxDragHelperKind::DragonDrop);
+    }
+
+    #[test]
+    fn missing_helper_disables_file_drag_without_disabling_backend() {
+        let session = LinuxSession::X11 {
+            display: ":0".to_owned(),
+        };
+        let mut backend = LinuxDragOutBackend::new(session, None);
+
+        assert!(!backend.can_drag_files());
+        assert!(matches!(
+            backend.begin_file_drag(
+                &[PathBuf::from("/tmp")],
+                DragPreview {
+                    label: "file".to_owned(),
+                    mime: "image/gif".to_owned(),
+                }
+            ),
+            Err(DragOutError::Unsupported(_))
+        ));
     }
 }
