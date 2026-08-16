@@ -1,5 +1,6 @@
 mod app;
 mod data;
+mod dev_metrics;
 mod emoji_cache;
 mod gif_provider;
 mod media_clipboard;
@@ -8,6 +9,7 @@ mod media_library;
 mod media_preview;
 mod preflight;
 mod settings;
+mod telegram_stickers;
 mod ui;
 
 use app::SymbolisApp;

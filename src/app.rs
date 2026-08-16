@@ -1,23 +1,25 @@
 use std::{
-    io,
+    collections::{BTreeMap, VecDeque},
+    fs, io,
     path::{Path, PathBuf},
     process::Command,
     sync::mpsc::{self, Receiver, Sender},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use eframe::egui::{Context, Key, ViewportCommand};
 
 use crate::{
     data::{DataSource, EmojiGroup, Entry, StoredEntry, load_entries, load_recent, recent_path},
+    dev_metrics::DevMetricsSampler,
     emoji_cache::EmojiCache,
     media_clipboard::MediaClipboard,
     media_drag::{DragOutBackend, DragPreview, LinuxDragOutBackend},
     media_library::{
-        MediaFormat, MediaItem, default_media_paths, export_media_for_transfer,
+        MediaFormat, MediaItem, MediaKind, default_media_paths, export_media_for_transfer,
         favorite_media_path, is_supported_media_path, load_favorite_media_ids, load_media_index,
-        load_recent_media, media_index_path, normalize_import_path, recent_media_path,
+        load_recent_media, media_index_path, media_root, normalize_import_path, recent_media_path,
         save_favorite_media_ids, save_media_as_webm, save_media_index, save_recent_media,
         scan_media_library, store_media_file_for_library,
     },
@@ -26,9 +28,16 @@ use crate::{
     settings::{
         UiSettings, configure_fonts, configure_style, load_settings, save_settings, settings_path,
     },
+    telegram_stickers::{
+        TELEGRAM_BOT_TOKEN_ENV, TelegramStickerImportSummary, clear_saved_telegram_bot_token,
+        import_telegram_sticker_set, import_telegram_sticker_set_with_progress,
+        load_saved_telegram_bot_token, save_telegram_bot_token, sticker_set_name_from_input,
+        telegram_bot_token, telegram_bot_token_from_env, telegram_secret_path,
+    },
 };
 
 const RECENT_LIMIT: usize = 48;
+const DEV_LOG_LIMIT: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MediaImportMode {
@@ -41,6 +50,7 @@ enum MediaJobRequest {
     OptimizedCopy { item: MediaItem, title: String },
     ExportForCopy { item: MediaItem },
     ExportForDrag { item: MediaItem },
+    ImportTelegramStickerSet { set_name: String, token: String },
 }
 
 enum MediaJobResult {
@@ -59,6 +69,14 @@ enum MediaJobResult {
     ExportForDrag {
         item: MediaItem,
         result: Result<PathBuf, String>,
+    },
+    TelegramStickerImport {
+        set_name: String,
+        result: Result<TelegramStickerImportSummary, String>,
+    },
+    TelegramStickerImportProgress {
+        set_name: String,
+        message: String,
     },
 }
 
@@ -81,18 +99,38 @@ enum MediaScanResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ContentMode {
     Symbols,
+    Stickers,
     Gifs,
 }
 
 impl ContentMode {
-    pub(crate) const CHOICES: [ContentMode; 2] = [ContentMode::Symbols, ContentMode::Gifs];
+    pub(crate) const CHOICES: [ContentMode; 3] = [
+        ContentMode::Symbols,
+        ContentMode::Stickers,
+        ContentMode::Gifs,
+    ];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
-            ContentMode::Symbols => "Symbols",
+            ContentMode::Symbols => "Emoji",
+            ContentMode::Stickers => "Stickers",
             ContentMode::Gifs => "GIFs",
         }
     }
+
+    pub(crate) fn media_kind(self) -> Option<MediaKind> {
+        match self {
+            ContentMode::Symbols => None,
+            ContentMode::Stickers => Some(MediaKind::Sticker),
+            ContentMode::Gifs => Some(MediaKind::Gif),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AppView {
+    Main,
+    Settings,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,6 +144,19 @@ pub(crate) enum MediaView {
 pub(crate) enum MediaItemSource {
     Library(usize),
     Recent(usize),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StickerPack {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DevLogEntry {
+    pub(crate) elapsed_ms: u128,
+    pub(crate) message: String,
 }
 
 impl MediaView {
@@ -152,12 +203,23 @@ pub(crate) struct SymbolisApp {
     pub(crate) media_items: Vec<MediaItem>,
     pub(crate) recent_media: Vec<MediaItem>,
     pub(crate) favorite_media_ids: Vec<String>,
+    pub(crate) app_view: AppView,
     pub(crate) content_mode: ContentMode,
     pub(crate) selected_tab: Tab,
     pub(crate) media_view: MediaView,
+    pub(crate) selected_sticker_pack_id: Option<String>,
     pub(crate) query: String,
     pub(crate) gif_query: String,
     pub(crate) gif_import_path_input: String,
+    pub(crate) telegram_bot_token_input: String,
+    pub(crate) telegram_bot_token_saved: bool,
+    pub(crate) telegram_bot_token_guide_visible: bool,
+    pub(crate) dev_panel_open: bool,
+    pub(crate) clear_everything_confirm: bool,
+    pub(crate) dev_metrics: DevMetricsSampler,
+    pub(crate) app_started_at: Instant,
+    pub(crate) dev_log: VecDeque<DevLogEntry>,
+    pub(crate) pending_sticker_pack_delete: Option<StickerPack>,
     pub(crate) recent_path: Option<PathBuf>,
     pub(crate) recent_media_path: Option<PathBuf>,
     pub(crate) favorite_media_path: Option<PathBuf>,
@@ -178,6 +240,7 @@ pub(crate) struct SymbolisApp {
     media_scan_rx: Receiver<MediaScanResult>,
     active_media_scans: usize,
     media_scan_generation: u64,
+    media_scan_completion_status: Option<(u64, String)>,
 }
 
 impl SymbolisApp {
@@ -206,6 +269,9 @@ impl SymbolisApp {
         let favorite_media_ids = load_favorite_media_ids(favorite_media_path.as_deref());
         let media_index_path = media_index_path();
         let media_items = load_media_index(media_index_path.as_deref());
+        let telegram_bot_token_input = load_saved_telegram_bot_token().unwrap_or_default();
+        let telegram_bot_token_saved = !telegram_bot_token_input.is_empty();
+        let app_started_at = Instant::now();
         let (media_job_tx, media_job_rx) = spawn_media_worker();
         let (media_scan_tx, media_scan_rx) = spawn_media_scan_worker();
         let clipboard = MediaClipboard::new()
@@ -217,12 +283,23 @@ impl SymbolisApp {
             media_items,
             recent_media,
             favorite_media_ids,
+            app_view: AppView::Main,
             content_mode: ContentMode::Symbols,
             selected_tab: Tab::Category(crate::data::Category::Emoji),
             media_view: MediaView::Library,
+            selected_sticker_pack_id: None,
             query: String::new(),
             gif_query: String::new(),
             gif_import_path_input: String::new(),
+            telegram_bot_token_input,
+            telegram_bot_token_saved,
+            telegram_bot_token_guide_visible: false,
+            dev_panel_open: false,
+            clear_everything_confirm: false,
+            dev_metrics: DevMetricsSampler::default(),
+            app_started_at,
+            dev_log: VecDeque::new(),
+            pending_sticker_pack_delete: None,
             recent_path,
             recent_media_path,
             favorite_media_path,
@@ -243,12 +320,17 @@ impl SymbolisApp {
             media_scan_rx,
             active_media_scans: 0,
             media_scan_generation: 0,
+            media_scan_completion_status: None,
         };
         app.reload_media_library();
         Ok(app)
     }
 
     pub(crate) fn filtered_entry_indices(&self) -> Vec<usize> {
+        if self.app_view != AppView::Main {
+            return Vec::new();
+        }
+
         let query = self.query.trim().to_lowercase();
 
         self.active_entries()
@@ -270,6 +352,13 @@ impl SymbolisApp {
     }
 
     pub(crate) fn filtered_media_sources(&self) -> Vec<MediaItemSource> {
+        if self.app_view != AppView::Main {
+            return Vec::new();
+        }
+
+        let Some(kind) = self.content_mode.media_kind() else {
+            return Vec::new();
+        };
         let query = self.gif_query.trim().to_lowercase();
 
         match self.media_view {
@@ -277,6 +366,8 @@ impl SymbolisApp {
                 .media_items
                 .iter()
                 .enumerate()
+                .filter(|(_, item)| item.kind == kind)
+                .filter(|(_, item)| self.matches_selected_sticker_pack(item))
                 .filter(|(_, item)| query.is_empty() || item.search_text.contains(&query))
                 .map(|(index, _)| MediaItemSource::Library(index))
                 .collect(),
@@ -284,6 +375,7 @@ impl SymbolisApp {
                 .media_items
                 .iter()
                 .enumerate()
+                .filter(|(_, item)| item.kind == kind)
                 .filter(|(_, item)| self.is_media_favorite(item))
                 .filter(|(_, item)| query.is_empty() || item.search_text.contains(&query))
                 .map(|(index, _)| MediaItemSource::Library(index))
@@ -292,6 +384,7 @@ impl SymbolisApp {
                 .recent_media
                 .iter()
                 .enumerate()
+                .filter(|(_, item)| item.kind == kind)
                 .filter(|(_, item)| query.is_empty() || item.search_text.contains(&query))
                 .map(|(index, _)| MediaItemSource::Recent(index))
                 .collect(),
@@ -304,6 +397,69 @@ impl SymbolisApp {
             MediaItemSource::Recent(index) => self.recent_media.get(index),
         }
         .cloned()
+    }
+
+    pub(crate) fn sticker_packs(&self) -> Vec<StickerPack> {
+        let mut packs = BTreeMap::<String, StickerPack>::new();
+        for item in &self.media_items {
+            if item.kind != MediaKind::Sticker {
+                continue;
+            }
+            let Some(id) = sticker_pack_id(item) else {
+                continue;
+            };
+            let label = sticker_pack_label(&id);
+            packs
+                .entry(id.clone())
+                .and_modify(|pack| pack.count += 1)
+                .or_insert(StickerPack {
+                    id,
+                    label,
+                    count: 1,
+                });
+        }
+
+        packs.into_values().collect()
+    }
+
+    pub(crate) fn select_sticker_pack(&mut self, pack_id: Option<String>) {
+        self.selected_sticker_pack_id = pack_id;
+        self.media_view = MediaView::Library;
+    }
+
+    pub(crate) fn selected_sticker_pack_id(&self) -> Option<&str> {
+        self.selected_sticker_pack_id.as_deref()
+    }
+
+    pub(crate) fn request_delete_sticker_pack(&mut self, pack: StickerPack) {
+        self.pending_sticker_pack_delete = Some(pack);
+    }
+
+    pub(crate) fn cancel_delete_sticker_pack(&mut self) {
+        self.pending_sticker_pack_delete = None;
+    }
+
+    fn matches_selected_sticker_pack(&self, item: &MediaItem) -> bool {
+        if self.content_mode != ContentMode::Stickers || self.media_view != MediaView::Library {
+            return true;
+        }
+
+        let Some(selected) = self.selected_sticker_pack_id() else {
+            return true;
+        };
+
+        sticker_pack_id(item).as_deref() == Some(selected)
+    }
+
+    fn retain_existing_sticker_pack_selection(&mut self) {
+        let Some(selected) = self.selected_sticker_pack_id.clone() else {
+            return;
+        };
+        if !self.media_items.iter().any(|item| {
+            item.kind == MediaKind::Sticker && sticker_pack_id(item) == Some(selected.clone())
+        }) {
+            self.selected_sticker_pack_id = None;
+        }
     }
 
     pub(crate) fn copy_entry(&mut self, entry: &Entry) {
@@ -481,7 +637,7 @@ impl SymbolisApp {
             return;
         }
 
-        self.content_mode = ContentMode::Gifs;
+        self.content_mode = content_mode_for_media_kind(item.kind);
         let status = if file_was_missing {
             format!("Removed missing media: {title}")
         } else {
@@ -490,7 +646,110 @@ impl SymbolisApp {
         self.queue_media_scan(format!("{status}; reindexing media library..."));
     }
 
+    pub(crate) fn delete_sticker_pack(&mut self, pack_id: &str) {
+        let pack_path = PathBuf::from(pack_id);
+        let pack_label = sticker_pack_label(pack_id);
+        let pack_items = self
+            .media_items
+            .iter()
+            .filter(|item| {
+                item.kind == MediaKind::Sticker && sticker_pack_id(item).as_deref() == Some(pack_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if pack_items.is_empty() {
+            self.pending_sticker_pack_delete = None;
+            self.status = Some(format!("Sticker pack not found: {pack_label}"));
+            self.log_dev(format!(
+                "delete sticker pack skipped; not found: {pack_label}"
+            ));
+            return;
+        }
+
+        let mut deleted = 0;
+        let mut missing = 0;
+        let mut errors = Vec::new();
+        let item_ids = pack_items
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+
+        for item in &pack_items {
+            match std::fs::remove_file(&item.path) {
+                Ok(()) => deleted += 1,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => missing += 1,
+                Err(err) => errors.push(format!("{}: {err}", item.title)),
+            }
+        }
+
+        self.favorite_media_ids
+            .retain(|id| !item_ids.iter().any(|item_id| item_id == id));
+        self.recent_media
+            .retain(|existing| !item_ids.iter().any(|item_id| item_id == &existing.id));
+        let settings_changed = self.settings.gif_import_paths.iter().any(|path| {
+            path == &pack_path || path.parent().is_some_and(|parent| parent == pack_path)
+        });
+        self.settings.gif_import_paths.retain(|path| {
+            !(path == &pack_path || path.parent().is_some_and(|parent| parent == pack_path))
+        });
+
+        let _ = std::fs::remove_dir(&pack_path);
+
+        if settings_changed
+            && let Err(err) = save_settings(self.settings_path.as_deref(), &self.settings)
+        {
+            self.status = Some(format!("Settings save error: {err}"));
+            return;
+        }
+        if let Err(err) = self.save_favorite_media_ids() {
+            self.status = Some(format!("Favorites save error: {err}"));
+            return;
+        }
+        if let Err(err) = self.save_recent_media() {
+            self.status = Some(format!("Recent media save error: {err}"));
+            return;
+        }
+
+        if self.selected_sticker_pack_id() == Some(pack_id) {
+            self.selected_sticker_pack_id = None;
+        }
+        self.pending_sticker_pack_delete = None;
+        self.app_view = AppView::Main;
+        self.content_mode = ContentMode::Stickers;
+        self.media_view = MediaView::Library;
+
+        let mut status = format!(
+            "Deleted sticker pack {pack_label}: {deleted} file{}",
+            plural_suffix(deleted)
+        );
+        if missing > 0 {
+            status.push_str(&format!(
+                "; removed {missing} missing file{}",
+                plural_suffix(missing)
+            ));
+        }
+        if !errors.is_empty() {
+            status.push_str(&format!(
+                "; {} delete error{}",
+                errors.len(),
+                plural_suffix(errors.len())
+            ));
+        }
+        if let Some(first_error) = errors.first() {
+            status.push_str(&format!(": {first_error}"));
+        }
+        self.log_dev(format!("delete sticker pack: {status}"));
+        self.queue_media_scan(format!("{status}; reindexing sticker library..."));
+    }
+
     pub(crate) fn add_media_import_path(&mut self, path: PathBuf) {
+        let input = path.to_string_lossy();
+        if let Some(set_name) = sticker_set_name_from_input(&input) {
+            self.import_telegram_sticker_set(set_name);
+            return;
+        }
+
         self.add_media_import_paths(vec![path]);
     }
 
@@ -507,12 +766,15 @@ impl SymbolisApp {
         let mut added = 0;
         let mut rejected = 0;
         let mut queued = 0;
+        let mut imported_content_mode = None;
 
         for path in paths {
             if !is_supported_media_path(&path) {
                 rejected += 1;
                 continue;
             }
+
+            imported_content_mode = Some(content_mode_for_media_path(&path));
 
             if mode == MediaImportMode::StoreFiles && path.is_file() {
                 if self.queue_media_job(MediaJobRequest::StoredImport {
@@ -553,7 +815,7 @@ impl SymbolisApp {
             self.save_settings();
         }
         if accepted > 0 || queued > 0 {
-            self.content_mode = ContentMode::Gifs;
+            self.content_mode = imported_content_mode.unwrap_or(ContentMode::Gifs);
             self.media_view = MediaView::Library;
         }
         let noun = if mode == MediaImportMode::StoreFiles {
@@ -587,6 +849,29 @@ impl SymbolisApp {
             self.queue_media_scan(status);
         } else {
             self.status = Some(status);
+        }
+    }
+
+    fn import_telegram_sticker_set(&mut self, set_name: String) {
+        let Some(token) = telegram_bot_token() else {
+            self.status = Some(format!(
+                "Telegram sticker import needs a bot token in Preferences or {TELEGRAM_BOT_TOKEN_ENV}"
+            ));
+            self.log_dev(format!(
+                "telegram import blocked for {set_name}; missing bot token"
+            ));
+            return;
+        };
+
+        if self.queue_media_job(MediaJobRequest::ImportTelegramStickerSet {
+            set_name: set_name.clone(),
+            token,
+        }) {
+            self.app_view = AppView::Main;
+            self.content_mode = ContentMode::Stickers;
+            self.media_view = MediaView::Library;
+            self.status = Some(format!("Importing Telegram sticker set: {set_name}"));
+            self.log_dev(format!("telegram import started: {set_name}"));
         }
     }
 
@@ -655,6 +940,117 @@ impl SymbolisApp {
         )
     }
 
+    pub(crate) fn telegram_bot_token_status(&self) -> String {
+        let env_configured = telegram_bot_token_from_env().is_some();
+        match (env_configured, self.telegram_bot_token_saved) {
+            (true, true) => format!(
+                "Telegram token: env override active; local token saved at {}",
+                telegram_secret_path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "config dir".to_owned())
+            ),
+            (true, false) => {
+                format!("Telegram token: configured via {TELEGRAM_BOT_TOKEN_ENV}")
+            }
+            (false, true) => format!(
+                "Telegram token: saved locally at {}",
+                telegram_secret_path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "config dir".to_owned())
+            ),
+            (false, false) => "Telegram token: not configured".to_owned(),
+        }
+    }
+
+    pub(crate) fn save_telegram_bot_token_setting(&mut self) {
+        match save_telegram_bot_token(&self.telegram_bot_token_input) {
+            Ok(()) => {
+                self.telegram_bot_token_input = self.telegram_bot_token_input.trim().to_owned();
+                self.telegram_bot_token_saved = true;
+                self.status = Some("Saved Telegram bot token".to_owned());
+            }
+            Err(err) => {
+                self.status = Some(format!("Telegram token save error: {err}"));
+            }
+        }
+    }
+
+    pub(crate) fn clear_telegram_bot_token_setting(&mut self) {
+        match clear_saved_telegram_bot_token() {
+            Ok(()) => {
+                self.telegram_bot_token_input.clear();
+                self.telegram_bot_token_saved = false;
+                self.status = Some("Cleared local Telegram bot token".to_owned());
+            }
+            Err(err) => {
+                self.status = Some(format!("Telegram token clear error: {err}"));
+            }
+        }
+    }
+
+    pub(crate) fn toggle_telegram_bot_token_guide(&mut self) {
+        self.telegram_bot_token_guide_visible = !self.telegram_bot_token_guide_visible;
+    }
+
+    pub(crate) fn active_media_job_count(&self) -> usize {
+        self.active_media_jobs
+    }
+
+    pub(crate) fn active_media_scan_count(&self) -> usize {
+        self.active_media_scans
+    }
+
+    pub(crate) fn dev_log_entries(&self) -> std::collections::vec_deque::Iter<'_, DevLogEntry> {
+        self.dev_log.iter()
+    }
+
+    pub(crate) fn clear_everything(&mut self) {
+        let mut errors = Vec::new();
+
+        remove_symbolis_tree(symbolis_data_root(), "data", &mut errors);
+        remove_symbolis_tree(symbolis_config_root(), "config", &mut errors);
+        remove_symbolis_tree(symbolis_cache_root(), "cache", &mut errors);
+        if let Some(root) = media_root() {
+            remove_path_if_exists(&root, "media", &mut errors);
+        }
+
+        self.recent.clear();
+        self.media_items.clear();
+        self.recent_media.clear();
+        self.favorite_media_ids.clear();
+        self.settings = UiSettings::default();
+        self.app_view = AppView::Main;
+        self.content_mode = ContentMode::Symbols;
+        self.selected_tab = Tab::Category(crate::data::Category::Emoji);
+        self.media_view = MediaView::Library;
+        self.selected_sticker_pack_id = None;
+        self.query.clear();
+        self.gif_query.clear();
+        self.gif_import_path_input.clear();
+        self.telegram_bot_token_input.clear();
+        self.telegram_bot_token_saved = false;
+        self.telegram_bot_token_guide_visible = false;
+        self.clear_everything_confirm = false;
+        self.pending_sticker_pack_delete = None;
+        self.dev_log.clear();
+        self.emoji_cache = EmojiCache::new(self.emoji_cache.color_renderer_available());
+        self.media_preview_cache = MediaPreviewCache::new();
+        self.media_scan_generation = self.media_scan_generation.wrapping_add(1);
+        self.media_scan_completion_status = None;
+
+        self.status = if errors.is_empty() {
+            Some("Cleared Symbolis data, config, cache, and local media".to_owned())
+        } else {
+            Some(format!(
+                "Clear finished with {} error{}: {}",
+                errors.len(),
+                plural_suffix(errors.len()),
+                errors.join("; ")
+            ))
+        };
+        self.log_dev("cleared Symbolis data/config/cache/local media");
+    }
+
     fn active_entries(&self) -> &[Entry] {
         match self.selected_tab {
             Tab::Recent => &self.recent,
@@ -701,7 +1097,19 @@ impl SymbolisApp {
         )
     }
 
+    fn log_dev(&mut self, message: impl Into<String>) {
+        if self.dev_log.len() >= DEV_LOG_LIMIT {
+            self.dev_log.pop_front();
+        }
+        self.dev_log.push_back(DevLogEntry {
+            elapsed_ms: self.app_started_at.elapsed().as_millis(),
+            message: message.into(),
+        });
+    }
+
     fn queue_media_job(&mut self, job: MediaJobRequest) -> bool {
+        let label = media_job_request_label(&job);
+        self.log_dev(format!("queue media job: {label}"));
         self.active_media_jobs += 1;
         if self.media_job_tx.send(job).is_ok() {
             return true;
@@ -709,31 +1117,48 @@ impl SymbolisApp {
 
         self.active_media_jobs = self.active_media_jobs.saturating_sub(1);
         self.status = Some("Media worker is unavailable".to_owned());
+        self.log_dev("media worker unavailable; job was not queued");
         false
     }
 
     fn queue_media_scan(&mut self, status: impl Into<String>) {
+        self.queue_media_scan_with_completion(status, None);
+    }
+
+    fn queue_media_scan_with_completion(
+        &mut self,
+        status: impl Into<String>,
+        completion_status: Option<String>,
+    ) {
         self.media_scan_generation = self.media_scan_generation.wrapping_add(1);
+        let generation = self.media_scan_generation;
         let request = MediaScanRequest::Scan {
-            generation: self.media_scan_generation,
+            generation,
             paths: media_scan_paths(&self.settings.gif_import_paths),
             index_path: self.media_index_path.clone(),
         };
         self.active_media_scans += 1;
         if self.media_scan_tx.send(request).is_ok() {
+            self.media_scan_completion_status =
+                completion_status.map(|status| (generation, status));
             self.status = Some(status.into());
+            self.log_dev(format!("queue media scan #{generation}"));
             return;
         }
 
         self.active_media_scans = self.active_media_scans.saturating_sub(1);
+        self.media_scan_completion_status = None;
         self.status = Some("Media scan worker is unavailable".to_owned());
+        self.log_dev(format!("media scan worker unavailable for #{generation}"));
     }
 
     fn poll_media_jobs(&mut self) {
         let mut completed = 0;
 
         while let Ok(result) = self.media_job_rx.try_recv() {
-            completed += 1;
+            if media_job_result_is_terminal(&result) {
+                completed += 1;
+            }
             self.handle_media_job_result(result);
         }
 
@@ -763,10 +1188,21 @@ impl SymbolisApp {
         } = result;
 
         if generation != self.media_scan_generation {
+            self.log_dev(format!(
+                "ignore stale media scan #{generation}; current is #{}",
+                self.media_scan_generation
+            ));
             return;
         }
 
+        let item_count = items.len();
         self.media_items = items;
+        self.retain_existing_sticker_pack_selection();
+        let completion_status = self
+            .media_scan_completion_status
+            .take()
+            .filter(|(status_generation, _)| *status_generation == generation)
+            .map(|(_, status)| status);
         self.recent_media.retain(|item| item.path.exists());
         if let Err(err) = self.save_recent_media() {
             self.status = Some(format!("Recent media save error: {err}"));
@@ -774,17 +1210,27 @@ impl SymbolisApp {
         }
 
         self.status = Some(if let Some(err) = index_save_error {
+            self.log_dev(format!("media scan #{generation} index save error: {err}"));
             format!("Media index save error: {err}")
+        } else if let Some(status) = completion_status {
+            self.log_dev(format!(
+                "media scan #{generation} complete; indexed {item_count} media files"
+            ));
+            format!("{status}; indexed {} media files", self.media_items.len())
         } else {
+            self.log_dev(format!(
+                "media scan #{generation} complete; indexed {item_count} media files"
+            ));
             format!("Indexed {} media files", self.media_items.len())
         });
     }
 
     fn handle_media_job_result(&mut self, result: MediaJobResult) {
+        self.log_dev(media_job_result_label(&result));
         match result {
             MediaJobResult::StoredImport { original, result } => match result {
                 Ok(path) => {
-                    self.content_mode = ContentMode::Gifs;
+                    self.content_mode = content_mode_for_media_path(&path);
                     self.media_view = MediaView::Library;
                     self.queue_media_scan(format!(
                         "Stored optimized media: {}; indexing media library...",
@@ -820,6 +1266,29 @@ impl SymbolisApp {
                     self.status = Some(format!("Media export error: {err}"));
                 }
             },
+            MediaJobResult::TelegramStickerImport { set_name, result } => match result {
+                Ok(summary) => {
+                    self.app_view = AppView::Main;
+                    self.content_mode = ContentMode::Stickers;
+                    self.media_view = MediaView::Library;
+                    let label = summary.status_label();
+                    self.queue_media_scan_with_completion(
+                        format!("{label}; indexing media library..."),
+                        Some(label),
+                    );
+                }
+                Err(err) => {
+                    self.status = Some(format!(
+                        "Telegram sticker import error for {set_name}: {err}"
+                    ));
+                }
+            },
+            MediaJobResult::TelegramStickerImportProgress { set_name, message } => {
+                self.app_view = AppView::Main;
+                self.content_mode = ContentMode::Stickers;
+                self.media_view = MediaView::Library;
+                self.status = Some(format!("Importing Telegram {set_name}: {message}"));
+            }
         }
     }
 
@@ -833,7 +1302,7 @@ impl SymbolisApp {
             self.settings.gif_import_paths.push(path.clone());
             self.save_settings();
         }
-        self.content_mode = ContentMode::Gifs;
+        self.content_mode = content_mode_for_media_path(&path);
         self.media_view = MediaView::Library;
         self.queue_media_scan(format!(
             "Imported original: {}; storage warning: {err}; indexing media library...",
@@ -856,8 +1325,21 @@ impl SymbolisApp {
     }
 
     fn handle_keyboard(&mut self, ctx: &Context) {
+        if ctx.input(|input| input.key_pressed(Key::F7)) {
+            self.dev_panel_open = !self.dev_panel_open;
+            self.clear_everything_confirm = false;
+        }
+
         if ctx.input(|input| input.key_pressed(Key::Escape)) {
-            ctx.send_viewport_cmd(ViewportCommand::Close);
+            if self.app_view == AppView::Settings {
+                self.app_view = AppView::Main;
+            } else {
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
+        }
+
+        if self.app_view != AppView::Main {
+            return;
         }
 
         if ctx.input(|input| input.key_pressed(Key::Enter)) {
@@ -871,7 +1353,7 @@ impl SymbolisApp {
                         self.copy_entry(&entry);
                     }
                 }
-                ContentMode::Gifs => {
+                ContentMode::Stickers | ContentMode::Gifs => {
                     if let Some(item) = self
                         .filtered_media_sources()
                         .first()
@@ -931,8 +1413,31 @@ fn spawn_media_worker() -> (Sender<MediaJobRequest>, Receiver<MediaJobResult>) {
 
     thread::spawn(move || {
         while let Ok(job) = job_rx.recv() {
-            if result_tx.send(run_media_job(job)).is_err() {
-                break;
+            match job {
+                MediaJobRequest::ImportTelegramStickerSet { set_name, token } => {
+                    let progress_tx = result_tx.clone();
+                    let progress_set_name = set_name.clone();
+                    let result =
+                        import_telegram_sticker_set_with_progress(&set_name, &token, |message| {
+                            let _ =
+                                progress_tx.send(MediaJobResult::TelegramStickerImportProgress {
+                                    set_name: progress_set_name.clone(),
+                                    message,
+                                });
+                        })
+                        .map_err(|err| err.to_string());
+                    if result_tx
+                        .send(MediaJobResult::TelegramStickerImport { set_name, result })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                job => {
+                    if result_tx.send(run_media_job(job)).is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -973,6 +1478,11 @@ fn run_media_job(job: MediaJobRequest) -> MediaJobResult {
             let result = export_media_for_transfer(&item).map_err(|err| err.to_string());
             MediaJobResult::ExportForDrag { item, result }
         }
+        MediaJobRequest::ImportTelegramStickerSet { set_name, token } => {
+            let result =
+                import_telegram_sticker_set(&set_name, &token).map_err(|err| err.to_string());
+            MediaJobResult::TelegramStickerImport { set_name, result }
+        }
     }
 }
 
@@ -996,12 +1506,119 @@ fn run_media_scan(request: MediaScanRequest) -> MediaScanResult {
     }
 }
 
+fn media_job_request_label(job: &MediaJobRequest) -> String {
+    match job {
+        MediaJobRequest::StoredImport { original } => {
+            format!("store import {}", media_path_label(original))
+        }
+        MediaJobRequest::OptimizedCopy { title, .. } => {
+            format!("save optimized WebM for {title}")
+        }
+        MediaJobRequest::ExportForCopy { item } => {
+            format!("export for clipboard {}", item.title)
+        }
+        MediaJobRequest::ExportForDrag { item } => {
+            format!("export for drag {}", item.title)
+        }
+        MediaJobRequest::ImportTelegramStickerSet { set_name, .. } => {
+            format!("import Telegram stickers {set_name}")
+        }
+    }
+}
+
+fn media_job_result_label(result: &MediaJobResult) -> String {
+    match result {
+        MediaJobResult::StoredImport { original, result } => match result {
+            Ok(path) => format!(
+                "job complete: stored {} -> {}",
+                media_path_label(original),
+                media_path_label(path)
+            ),
+            Err(err) => format!("job failed: store {}: {err}", media_path_label(original)),
+        },
+        MediaJobResult::OptimizedCopy { title, result } => match result {
+            Ok(path) => format!(
+                "job complete: optimized {title} -> {}",
+                media_path_label(path)
+            ),
+            Err(err) => format!("job failed: optimize {title}: {err}"),
+        },
+        MediaJobResult::ExportForCopy { item, result } => match result {
+            Ok(path) => format!(
+                "job complete: exported {} for clipboard -> {}",
+                item.title,
+                media_path_label(path)
+            ),
+            Err(err) => format!("job failed: export {} for clipboard: {err}", item.title),
+        },
+        MediaJobResult::ExportForDrag { item, result } => match result {
+            Ok(path) => format!(
+                "job complete: exported {} for drag -> {}",
+                item.title,
+                media_path_label(path)
+            ),
+            Err(err) => format!("job failed: export {} for drag: {err}", item.title),
+        },
+        MediaJobResult::TelegramStickerImport { set_name, result } => match result {
+            Ok(summary) => format!(
+                "job complete: Telegram {set_name}; imported {}, skipped animated {}, unsupported {}, failed {}",
+                summary.imported,
+                summary.skipped_animated,
+                summary.skipped_unsupported,
+                summary.failed
+            ),
+            Err(err) => format!("job failed: Telegram {set_name}: {err}"),
+        },
+        MediaJobResult::TelegramStickerImportProgress { set_name, message } => {
+            format!("job progress: Telegram {set_name}: {message}")
+        }
+    }
+}
+
+fn media_job_result_is_terminal(result: &MediaJobResult) -> bool {
+    !matches!(result, MediaJobResult::TelegramStickerImportProgress { .. })
+}
+
 fn plural_suffix(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
 }
 
 fn media_transfer_requires_export(item: &MediaItem) -> bool {
     matches!(item.format, MediaFormat::Mp4 | MediaFormat::Webm)
+}
+
+fn content_mode_for_media_kind(kind: MediaKind) -> ContentMode {
+    match kind {
+        MediaKind::Gif => ContentMode::Gifs,
+        MediaKind::Sticker => ContentMode::Stickers,
+    }
+}
+
+fn content_mode_for_media_path(path: &Path) -> ContentMode {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png" | "webp") => ContentMode::Stickers,
+        _ => ContentMode::Gifs,
+    }
+}
+
+fn sticker_pack_id(item: &MediaItem) -> Option<String> {
+    item.path
+        .parent()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+fn sticker_pack_label(id: &str) -> String {
+    Path::new(id)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.replace(['_', '-'], " "))
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "Loose stickers".to_owned())
 }
 
 fn media_path_label(path: &Path) -> String {
@@ -1039,6 +1656,44 @@ fn media_scan_paths(import_paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut paths = default_media_paths();
     paths.extend(import_paths.iter().cloned());
     paths
+}
+
+fn symbolis_data_root() -> Option<PathBuf> {
+    dirs::data_dir().map(|dir| dir.join("symbolis"))
+}
+
+fn symbolis_config_root() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("symbolis"))
+}
+
+fn symbolis_cache_root() -> Option<PathBuf> {
+    dirs::cache_dir().map(|dir| dir.join("symbolis"))
+}
+
+fn remove_symbolis_tree(path: Option<PathBuf>, label: &str, errors: &mut Vec<String>) {
+    let Some(path) = path else {
+        return;
+    };
+    if path.file_name().and_then(|name| name.to_str()) != Some("symbolis") {
+        errors.push(format!("refused to remove unexpected {label} path"));
+        return;
+    }
+    remove_path_if_exists(&path, label, errors);
+}
+
+fn remove_path_if_exists(path: &Path, label: &str, errors: &mut Vec<String>) {
+    if !path.exists() {
+        return;
+    }
+
+    let result = if path.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+    if let Err(err) = result {
+        errors.push(format!("{label}: {err}"));
+    }
 }
 
 fn is_default_media_scan_path(path: &Path) -> bool {

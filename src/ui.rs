@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use eframe::egui::{
     self, Align, Align2, Button, Color32, Context, FontId, Frame, Key, Layout, Rect, RichText,
     Rounding, ScrollArea, Sense, Stroke, TextEdit, TopBottomPanel, color_picker::Alpha,
@@ -6,14 +8,15 @@ use eframe::egui::{
 
 use crate::{
     app::{
-        ContentMode, MediaItemSource, MediaView, SymbolisApp, Tab, has_hovered_files,
+        AppView, ContentMode, MediaItemSource, MediaView, SymbolisApp, Tab, has_hovered_files,
         hovered_media_drop_count,
     },
     data::{Category, DataSource, EmojiGroup, Entry},
+    dev_metrics::{DevMetricsSnapshot, GpuMetric},
     gif_provider::{GifProvider, ProviderStatus},
     media_drag::DragOutBackend,
-    media_library::{MediaFormat, MediaItem},
-    settings::{InterfaceMode, Preset, Rgb, ThemeSelection},
+    media_library::{MediaFormat, MediaItem, MediaKind},
+    settings::{InterfaceMode, Palette, Preset, Rgb, ThemeSelection},
 };
 
 const SIDEBAR_WIDTH: f32 = 56.0;
@@ -26,6 +29,8 @@ const SIDEBAR_GROUP_SIZE: f32 = 32.0;
 const SIDEBAR_SETTINGS_HEIGHT: f32 = 58.0;
 const SIDEBAR_STACK_GAP: f32 = 5.0;
 const SIDEBAR_STACK_MAX_VISIBLE_ITEMS: f32 = 2.35;
+const STICKER_PACK_SIDEBAR_MIN_WIDTH: f32 = 620.0;
+const COMPACT_TOPBAR_MAX_WIDTH: f32 = 560.0;
 
 #[derive(Clone, Copy)]
 struct Chrome {
@@ -186,13 +191,13 @@ impl SymbolisApp {
     pub(crate) fn draw(&mut self, ctx: &Context) {
         let chrome = chrome(self.settings.interface_mode);
         let filtered_entries =
-            if self.selected_tab != Tab::Settings && self.content_mode == ContentMode::Symbols {
+            if self.app_view == AppView::Main && self.content_mode == ContentMode::Symbols {
                 Some(self.filtered_entry_indices())
             } else {
                 None
             };
         let filtered_media =
-            if self.selected_tab != Tab::Settings && self.content_mode == ContentMode::Gifs {
+            if self.app_view == AppView::Main && self.content_mode.media_kind().is_some() {
                 Some(self.filtered_media_sources())
             } else {
                 None
@@ -206,13 +211,16 @@ impl SymbolisApp {
         };
 
         self.draw_sidebar(ctx);
+        if self.should_draw_sticker_pack_sidebar(ctx) {
+            self.draw_sticker_pack_sidebar(ctx);
+        }
         self.draw_topbar(ctx);
         self.draw_footer(ctx, count);
 
         egui::CentralPanel::default()
             .frame(Frame::none().fill(self.settings.palette.bg.color()))
             .show(ctx, |ui| {
-                if self.selected_tab == Tab::Settings {
+                if self.app_view == AppView::Settings {
                     self.draw_settings(ui, ctx);
                     return;
                 }
@@ -227,6 +235,30 @@ impl SymbolisApp {
 
                         ui.add_space(chrome.content_top_space);
                         draw_symbol_grid(ui, self, filtered);
+                    }
+                    ContentMode::Stickers => {
+                        let filtered = filtered_media.as_deref().unwrap_or(&[]);
+                        if filtered.is_empty() {
+                            let message = match self.media_view {
+                                MediaView::Library
+                                    if self.media_items.is_empty()
+                                        && self.media_scan_in_progress() =>
+                                {
+                                    "Indexing sticker library..."
+                                }
+                                MediaView::Library if self.media_items.is_empty() => {
+                                    "Import Telegram stickers or drop WebP/PNG/WebM here"
+                                }
+                                MediaView::Library => "No stickers match",
+                                MediaView::Favorites => "No favorite stickers yet",
+                                MediaView::RecentlyUsed => "No recently used stickers yet",
+                            };
+                            draw_empty_state(ui, self, message);
+                            return;
+                        }
+
+                        ui.add_space(chrome.content_top_space);
+                        draw_media_grid(ui, self, filtered);
                     }
                     ContentMode::Gifs => {
                         let filtered = filtered_media.as_deref().unwrap_or(&[]);
@@ -255,10 +287,61 @@ impl SymbolisApp {
                 }
             });
         self.draw_drop_overlay(ctx);
+        self.draw_dev_panel(ctx);
+        self.draw_sticker_pack_delete_confirm(ctx);
+    }
+
+    fn draw_sticker_pack_delete_confirm(&mut self, ctx: &Context) {
+        let Some(pack) = self.pending_sticker_pack_delete.clone() else {
+            return;
+        };
+        let palette = self.settings.palette;
+
+        egui::Window::new("Delete sticker pack")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_width(330.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(format!("Delete {}?", pack.label))
+                        .size(15.0)
+                        .strong()
+                        .color(palette.text.color()),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!(
+                        "This removes {} sticker file{} from disk. The pack folder is removed only if it becomes empty.",
+                        pack.count,
+                        if pack.count == 1 { "" } else { "s" },
+                    ))
+                    .size(12.0)
+                    .color(palette.muted.color()),
+                );
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let delete = Button::new(
+                        RichText::new("Delete pack")
+                            .size(12.0)
+                            .color(Color32::WHITE),
+                    )
+                    .fill(palette.danger.color());
+                    if ui.add(delete).clicked() {
+                        self.delete_sticker_pack(&pack.id);
+                    }
+                    if ui
+                        .button(RichText::new("Cancel").color(palette.text.color()))
+                        .clicked()
+                    {
+                        self.cancel_delete_sticker_pack();
+                    }
+                });
+            });
     }
 
     fn draw_sidebar(&mut self, ctx: &Context) {
-        if self.content_mode == ContentMode::Gifs && self.selected_tab != Tab::Settings {
+        if self.content_mode.media_kind().is_some() {
             self.draw_gif_sidebar(ctx);
             return;
         }
@@ -306,7 +389,12 @@ impl SymbolisApp {
                     Layout::top_down(Align::Center),
                     |ui| {
                         ui.add_space(10.0);
-                        self.media_sidebar_button(ui, MediaView::Library, "GIF", true);
+                        let library_icon = if self.content_mode == ContentMode::Stickers {
+                            "▦"
+                        } else {
+                            "GIF"
+                        };
+                        self.media_sidebar_button(ui, MediaView::Library, library_icon, true);
                         ui.add_space(8.0);
                         self.media_sidebar_button(ui, MediaView::Favorites, "★", true);
                         ui.add_space(8.0);
@@ -325,6 +413,82 @@ impl SymbolisApp {
             });
     }
 
+    fn draw_sticker_pack_sidebar(&mut self, ctx: &Context) {
+        let modern = self.settings.interface_mode.is_modern();
+        let width = if modern { 176.0 } else { 154.0 };
+
+        egui::SidePanel::left("sticker_pack_sidebar")
+            .resizable(false)
+            .exact_width(width)
+            .frame(Frame::none().fill(self.settings.palette.panel.color()))
+            .show(ctx, |ui| {
+                ui.add_space(if modern { 14.0 } else { 12.0 });
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    ui.label(
+                        RichText::new("Sticker packs")
+                            .size(12.0)
+                            .strong()
+                            .color(self.settings.palette.muted.color()),
+                    );
+                });
+                ui.add_space(8.0);
+
+                let packs = self.sticker_packs();
+                let total = packs.iter().map(|pack| pack.count).sum::<usize>();
+
+                ScrollArea::vertical()
+                    .id_salt("sticker_pack_sidebar")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let all_selected = self.media_view == MediaView::Library
+                            && self.selected_sticker_pack_id().is_none();
+                        if draw_sticker_pack_row(ui, self, "All stickers", total, all_selected)
+                            .clicked()
+                        {
+                            self.select_sticker_pack(None);
+                        }
+
+                        ui.add_space(4.0);
+                        for pack in packs {
+                            let selected = self.media_view == MediaView::Library
+                                && self.selected_sticker_pack_id() == Some(pack.id.as_str());
+                            let response =
+                                draw_sticker_pack_row(ui, self, &pack.label, pack.count, selected);
+                            if response.clicked() {
+                                self.select_sticker_pack(Some(pack.id.clone()));
+                            }
+                            response.context_menu(|ui| {
+                                if ui
+                                    .button(
+                                        RichText::new("Delete sticker pack")
+                                            .color(self.settings.palette.danger.color()),
+                                    )
+                                    .on_hover_text("Deletes every indexed sticker in this pack")
+                                    .clicked()
+                                {
+                                    self.request_delete_sticker_pack(pack.clone());
+                                    ui.close_menu();
+                                }
+                            });
+                            ui.add_space(4.0);
+                        }
+
+                        if total == 0 {
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space(12.0);
+                                ui.label(
+                                    RichText::new("No packs yet")
+                                        .size(12.0)
+                                        .color(self.settings.palette.muted.color()),
+                                );
+                            });
+                        }
+                    });
+            });
+    }
+
     fn media_sidebar_button(
         &mut self,
         ui: &mut egui::Ui,
@@ -336,7 +500,7 @@ impl SymbolisApp {
             ui,
             view.label(),
             icon,
-            self.media_view == view,
+            self.app_view == AppView::Main && self.media_view == view,
             enabled,
             false,
             false,
@@ -344,6 +508,7 @@ impl SymbolisApp {
         );
 
         if response.clicked() && enabled {
+            self.app_view = AppView::Main;
             self.media_view = view;
         }
     }
@@ -383,11 +548,16 @@ impl SymbolisApp {
         );
 
         if response.clicked() {
+            self.app_view = AppView::Main;
             self.selected_tab = group.default_tab();
         }
     }
 
     fn active_sidebar_group(&self) -> Option<SidebarGroup> {
+        if self.app_view != AppView::Main {
+            return None;
+        }
+
         match self.selected_tab {
             Tab::Category(Category::Emoji) | Tab::EmojiGroup(_) => Some(SidebarGroup::Emoji),
             Tab::Category(category) => SidebarGroup::for_category(category),
@@ -492,7 +662,11 @@ impl SymbolisApp {
         emoji_icon: bool,
         opacity: f32,
     ) {
-        let selected = self.selected_tab == tab;
+        let selected = if tab == Tab::Settings {
+            self.app_view == AppView::Settings
+        } else {
+            self.app_view == AppView::Main && self.selected_tab == tab
+        };
         let is_group = matches!(tab, Tab::EmojiGroup(_));
         let response = self.sidebar_icon_button(
             ui,
@@ -506,7 +680,12 @@ impl SymbolisApp {
         );
 
         if response.clicked() && enabled {
-            self.selected_tab = tab;
+            if tab == Tab::Settings {
+                self.app_view = AppView::Settings;
+            } else {
+                self.app_view = AppView::Main;
+                self.selected_tab = tab;
+            }
         }
     }
 
@@ -620,85 +799,26 @@ impl SymbolisApp {
     fn draw_topbar(&mut self, ctx: &Context) {
         let chrome = chrome(self.settings.interface_mode);
         let modern = self.settings.interface_mode.is_modern();
+        let compact = self.compact_topbar(ctx);
+        let topbar_height = if compact {
+            chrome.topbar_height + 34.0
+        } else {
+            chrome.topbar_height
+        };
 
         TopBottomPanel::top("top_bar")
-            .exact_height(chrome.topbar_height)
+            .exact_height(topbar_height)
             .frame(Frame::none().fill(if modern {
                 self.settings.palette.bg.color()
             } else {
                 self.settings.palette.panel.color()
             }))
             .show(ctx, |ui| {
-                ui.add_space(if modern { 16.0 } else { 13.0 });
-                ui.horizontal(|ui| {
-                    ui.add_space(if modern { 18.0 } else { 14.0 });
-                    self.draw_mode_switch(ui);
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new(self.topbar_title())
-                            .size(if modern { 22.0 } else { 20.0 })
-                            .strong()
-                            .color(self.settings.palette.text.color()),
-                    );
-
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.add_space(if modern { 16.0 } else { 12.0 });
-
-                        if self.content_mode == ContentMode::Symbols
-                            && self.selected_tab == Tab::Recent
-                            && !self.recent.is_empty()
-                        {
-                            if ui
-                                .button(
-                                    RichText::new("Clear")
-                                        .color(self.settings.palette.text.color()),
-                                )
-                                .on_hover_text("Clear recent symbols")
-                                .clicked()
-                            {
-                                self.clear_recent();
-                            }
-                            ui.add_space(if modern { 12.0 } else { 10.0 });
-                        }
-
-                        if self.content_mode == ContentMode::Gifs
-                            && self.media_view == MediaView::RecentlyUsed
-                            && !self.recent_media.is_empty()
-                        {
-                            if ui
-                                .button(
-                                    RichText::new("Clear")
-                                        .color(self.settings.palette.text.color()),
-                                )
-                                .on_hover_text("Clear recent GIFs")
-                                .clicked()
-                            {
-                                self.clear_recent_media();
-                            }
-                            ui.add_space(if modern { 12.0 } else { 10.0 });
-                        }
-
-                        if self.selected_tab != Tab::Settings {
-                            let width = ui
-                                .available_width()
-                                .min(if modern { 300.0 } else { 260.0 })
-                                .max(150.0);
-                            let hint = match self.content_mode {
-                                ContentMode::Symbols => "Search symbols...",
-                                ContentMode::Gifs => "Search local GIFs...",
-                            };
-                            let query = match self.content_mode {
-                                ContentMode::Symbols => &mut self.query,
-                                ContentMode::Gifs => &mut self.gif_query,
-                            };
-                            let response = ui.add_sized(
-                                [width, if modern { 36.0 } else { 32.0 }],
-                                TextEdit::singleline(query).hint_text(hint),
-                            );
-                            response.request_focus();
-                        }
-                    });
-                });
+                if compact {
+                    self.draw_compact_topbar(ui, ctx, modern);
+                } else {
+                    self.draw_full_topbar(ui, modern);
+                }
                 if modern {
                     let y = ui.max_rect().bottom() - 1.0;
                     ui.painter().line_segment(
@@ -713,11 +833,195 @@ impl SymbolisApp {
             });
     }
 
+    fn draw_full_topbar(&mut self, ui: &mut egui::Ui, modern: bool) {
+        ui.add_space(if modern { 16.0 } else { 13.0 });
+        ui.horizontal(|ui| {
+            ui.add_space(if modern { 18.0 } else { 14.0 });
+            self.draw_mode_switch(ui);
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(self.topbar_title())
+                    .size(if modern { 22.0 } else { 20.0 })
+                    .strong()
+                    .color(self.settings.palette.text.color()),
+            );
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_space(if modern { 16.0 } else { 12.0 });
+                self.draw_topbar_clear_actions(ui, modern);
+
+                if self.app_view == AppView::Main {
+                    let width = ui
+                        .available_width()
+                        .min(if modern { 300.0 } else { 260.0 })
+                        .max(150.0);
+                    self.draw_topbar_search(ui, modern, width);
+                }
+            });
+        });
+    }
+
+    fn draw_compact_topbar(&mut self, ui: &mut egui::Ui, ctx: &Context, modern: bool) {
+        ui.add_space(if modern { 10.0 } else { 8.0 });
+        ui.horizontal(|ui| {
+            ui.add_space(10.0);
+            self.draw_mode_switch(ui);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_space(10.0);
+                self.draw_topbar_clear_actions(ui, modern);
+            });
+        });
+
+        if self.app_view != AppView::Main {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new(self.topbar_title())
+                        .size(if modern { 18.0 } else { 16.0 })
+                        .strong()
+                        .color(self.settings.palette.text.color()),
+                );
+            });
+            return;
+        }
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.add_space(10.0);
+            if self.content_mode == ContentMode::Stickers
+                && !self.should_draw_sticker_pack_sidebar(ctx)
+                && self.media_view == MediaView::Library
+                && !self.sticker_packs().is_empty()
+            {
+                self.draw_compact_sticker_pack_picker(ui);
+                ui.add_space(6.0);
+            }
+            let width = ui.available_width().clamp(96.0, 270.0);
+            self.draw_topbar_search(ui, modern, width);
+        });
+    }
+
+    fn draw_topbar_clear_actions(&mut self, ui: &mut egui::Ui, modern: bool) {
+        if self.app_view == AppView::Main
+            && self.content_mode == ContentMode::Symbols
+            && self.selected_tab == Tab::Recent
+            && !self.recent.is_empty()
+        {
+            if ui
+                .button(RichText::new("Clear").color(self.settings.palette.text.color()))
+                .on_hover_text("Clear recent symbols")
+                .clicked()
+            {
+                self.clear_recent();
+            }
+            ui.add_space(if modern { 12.0 } else { 10.0 });
+        }
+
+        if self.app_view == AppView::Main
+            && self.content_mode.media_kind().is_some()
+            && self.media_view == MediaView::RecentlyUsed
+            && !self.recent_media.is_empty()
+        {
+            if ui
+                .button(RichText::new("Clear").color(self.settings.palette.text.color()))
+                .on_hover_text("Clear recent media")
+                .clicked()
+            {
+                self.clear_recent_media();
+            }
+            ui.add_space(if modern { 12.0 } else { 10.0 });
+        }
+    }
+
+    fn draw_topbar_search(&mut self, ui: &mut egui::Ui, modern: bool, width: f32) {
+        let hint = match self.content_mode {
+            ContentMode::Symbols => "Search symbols...",
+            ContentMode::Stickers => "Search stickers...",
+            ContentMode::Gifs => "Search local GIFs...",
+        };
+        let query = match self.content_mode {
+            ContentMode::Symbols => &mut self.query,
+            ContentMode::Stickers => &mut self.gif_query,
+            ContentMode::Gifs => &mut self.gif_query,
+        };
+        let response = ui.add_sized(
+            [width, if modern { 34.0 } else { 30.0 }],
+            TextEdit::singleline(query).hint_text(hint),
+        );
+        response.request_focus();
+    }
+
+    fn draw_compact_sticker_pack_picker(&mut self, ui: &mut egui::Ui) {
+        let packs = self.sticker_packs();
+        let total = packs.iter().map(|pack| pack.count).sum::<usize>();
+        let selected_pack = self
+            .selected_sticker_pack_id()
+            .and_then(|selected| packs.iter().find(|pack| pack.id == selected))
+            .cloned();
+        let selected_label = self
+            .selected_sticker_pack_id()
+            .and_then(|selected| {
+                packs
+                    .iter()
+                    .find(|pack| pack.id == selected)
+                    .map(|pack| pack.label.as_str())
+            })
+            .unwrap_or("All");
+
+        egui::ComboBox::from_id_salt("compact_sticker_pack_picker")
+            .selected_text(truncate_chars(selected_label, 14))
+            .width(112.0)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(
+                        self.selected_sticker_pack_id().is_none(),
+                        format!("All ({total})"),
+                    )
+                    .clicked()
+                {
+                    self.select_sticker_pack(None);
+                    ui.close_menu();
+                }
+
+                for pack in &packs {
+                    let selected = self.selected_sticker_pack_id() == Some(pack.id.as_str());
+                    if ui
+                        .selectable_label(
+                            selected,
+                            format!("{} ({})", truncate_chars(&pack.label, 22), pack.count),
+                        )
+                        .clicked()
+                    {
+                        self.select_sticker_pack(Some(pack.id.clone()));
+                        ui.close_menu();
+                    }
+                }
+            });
+
+        if let Some(pack) = selected_pack
+            && ui
+                .add_sized(
+                    [28.0, 30.0],
+                    Button::new(
+                        RichText::new("x")
+                            .size(13.0)
+                            .strong()
+                            .color(self.settings.palette.danger.color()),
+                    ),
+                )
+                .on_hover_text(format!("Delete sticker pack {}", pack.label))
+                .clicked()
+        {
+            self.request_delete_sticker_pack(pack);
+        }
+    }
+
     fn draw_mode_switch(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             for mode in ContentMode::CHOICES {
-                let selected = self.content_mode == mode && self.selected_tab != Tab::Settings;
+                let selected = self.content_mode == mode;
                 let button = Button::new(
                     RichText::new(mode.label())
                         .size(12.0)
@@ -730,24 +1034,33 @@ impl SymbolisApp {
                 });
 
                 if ui.add(button).clicked() {
+                    self.app_view = AppView::Main;
                     self.content_mode = mode;
-                    if self.selected_tab == Tab::Settings {
-                        self.selected_tab = Tab::Category(Category::Emoji);
-                    }
                 }
             }
         });
     }
 
     fn topbar_title(&self) -> &'static str {
-        if self.selected_tab == Tab::Settings {
-            return self.selected_tab.label();
+        if self.app_view == AppView::Settings {
+            return "Preferences";
         }
 
         match self.content_mode {
             ContentMode::Symbols => self.selected_tab.label(),
+            ContentMode::Stickers => "Stickers",
             ContentMode::Gifs => self.media_view.label(),
         }
+    }
+
+    fn should_draw_sticker_pack_sidebar(&self, ctx: &Context) -> bool {
+        self.app_view == AppView::Main
+            && self.content_mode == ContentMode::Stickers
+            && ctx.screen_rect().width() >= STICKER_PACK_SIDEBAR_MIN_WIDTH
+    }
+
+    fn compact_topbar(&self, ctx: &Context) -> bool {
+        ctx.screen_rect().width() < COMPACT_TOPBAR_MAX_WIDTH
     }
 
     fn draw_drop_overlay(&self, ctx: &Context) {
@@ -779,12 +1092,101 @@ impl SymbolisApp {
             Align2::CENTER_CENTER,
             if supported == 0 {
                 "Drop GIF, MP4, PNG, WebP, WebM, or a folder"
+            } else if self.content_mode == ContentMode::Stickers {
+                "Drop to add to sticker library"
             } else {
                 "Drop to add to GIF library"
             },
             FontId::proportional(20.0),
             self.settings.palette.text.color(),
         );
+    }
+
+    fn draw_dev_panel(&mut self, ctx: &Context) {
+        if !self.dev_panel_open {
+            return;
+        }
+
+        ctx.request_repaint_after(Duration::from_secs(1));
+        let snapshot = self.dev_metrics.snapshot().clone();
+        let mut open = self.dev_panel_open;
+        let palette = self.settings.palette;
+
+        egui::Window::new("Dev stuff")
+            .open(&mut open)
+            .default_width(380.0)
+            .default_pos(egui::pos2(84.0, 86.0))
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new("F7 toggles this panel")
+                        .size(12.0)
+                        .color(palette.muted.color()),
+                );
+                ui.add_space(8.0);
+                draw_dev_metrics(ui, palette, &snapshot);
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(8.0);
+                draw_dev_console(ui, self, palette);
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Danger Zone")
+                        .strong()
+                        .color(palette.danger.color()),
+                );
+                ui.label(
+                    RichText::new(
+                        "Clears Symbolis config, cache, recent/favorites, token, indexes, and local stored media. External folders are not deleted.",
+                    )
+                    .size(12.0)
+                    .color(palette.muted.color()),
+                );
+                ui.add_space(6.0);
+
+                if self.clear_everything_confirm {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .add(
+                                Button::new(
+                                    RichText::new("Really clear everything")
+                                        .color(Color32::WHITE),
+                                )
+                                .fill(palette.danger.color()),
+                            )
+                            .clicked()
+                        {
+                            self.clear_everything();
+                        }
+                        if ui
+                            .add(
+                                Button::new(
+                                    RichText::new("Cancel").color(palette.text.color()),
+                                )
+                                .fill(palette.tile.color()),
+                            )
+                            .clicked()
+                        {
+                            self.clear_everything_confirm = false;
+                        }
+                    });
+                } else if ui
+                    .add(
+                        Button::new(RichText::new("Clear everything").color(Color32::WHITE))
+                            .fill(palette.danger.color()),
+                    )
+                    .clicked()
+                {
+                    self.clear_everything_confirm = true;
+                }
+            });
+
+        self.dev_panel_open = open;
+        if !self.dev_panel_open {
+            self.clear_everything_confirm = false;
+        }
     }
 
     fn draw_footer(&self, ctx: &Context, count: usize) {
@@ -845,14 +1247,25 @@ impl SymbolisApp {
                                     .color(color),
                             );
                         }
-                        ContentMode::Gifs => {
+                        ContentMode::Stickers | ContentMode::Gifs => {
+                            let media_kind = self
+                                .content_mode
+                                .media_kind()
+                                .expect("media content mode has a media kind");
+                            let indexed_count = self
+                                .media_items
+                                .iter()
+                                .filter(|item| item.kind == media_kind)
+                                .count();
+                            let noun = match self.content_mode {
+                                ContentMode::Stickers => "stickers",
+                                ContentMode::Gifs => "GIFs",
+                                ContentMode::Symbols => "media files",
+                            };
                             ui.label(
-                                RichText::new(format!(
-                                    "local library: {} files",
-                                    self.media_items.len()
-                                ))
-                                .size(12.0)
-                                .color(self.settings.palette.muted.color()),
+                                RichText::new(format!("local library: {indexed_count} {noun}",))
+                                    .size(12.0)
+                                    .color(self.settings.palette.muted.color()),
                             );
 
                             ui.separator();
@@ -1061,10 +1474,81 @@ impl SymbolisApp {
 
                             ui.add_space(12.0);
                             ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("Telegram bot token")
+                                        .size(12.0)
+                                        .color(self.settings.palette.text.color()),
+                                );
+                                if ui
+                                    .add(
+                                        Button::new(
+                                            RichText::new("Guide")
+                                                .color(self.settings.palette.text.color()),
+                                        )
+                                        .fill(self.settings.palette.tile.color()),
+                                    )
+                                    .clicked()
+                                {
+                                    self.toggle_telegram_bot_token_guide();
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                let response = ui.add_sized(
+                                    [ui.available_width().min(420.0), 28.0],
+                                    TextEdit::singleline(&mut self.telegram_bot_token_input)
+                                        .password(true)
+                                        .hint_text("BotFather HTTP API token"),
+                                );
+
+                                if ui
+                                    .add(
+                                        Button::new(
+                                            RichText::new("Save")
+                                                .color(self.settings.palette.text.color()),
+                                        )
+                                        .fill(self.settings.palette.tile.color()),
+                                    )
+                                    .clicked()
+                                    || (response.lost_focus()
+                                        && ui.input(|input| input.key_pressed(Key::Enter)))
+                                {
+                                    self.save_telegram_bot_token_setting();
+                                }
+
+                                if ui
+                                    .add(
+                                        Button::new(
+                                            RichText::new("Clear")
+                                                .color(self.settings.palette.danger.color()),
+                                        )
+                                        .fill(self.settings.palette.tile.color()),
+                                    )
+                                    .clicked()
+                                {
+                                    self.clear_telegram_bot_token_setting();
+                                }
+                            });
+                            ui.label(
+                                RichText::new(self.telegram_bot_token_status())
+                                    .size(12.0)
+                                    .color(self.settings.palette.muted.color()),
+                            );
+                            if self.telegram_bot_token_guide_visible {
+                                ui.label(
+                                    RichText::new(
+                                        "Guide: open @BotFather in Telegram, send /newbot, copy the HTTP API token, paste it here, then Save. If a token leaks, revoke it in BotFather and save the new one.",
+                                    )
+                                    .size(12.0)
+                                    .color(self.settings.palette.muted.color()),
+                                );
+                            }
+
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
                                 let response = ui.add_sized(
                                     [ui.available_width().min(420.0), 28.0],
                                     TextEdit::singleline(&mut self.gif_import_path_input)
-                                        .hint_text("/path/to/folder or /path/to/file.mp4"),
+                                        .hint_text("/path/to/folder, file.mp4, or t.me/addstickers/..."),
                                 );
 
                                 if ui
@@ -1103,7 +1587,7 @@ impl SymbolisApp {
                             ui.add_space(8.0);
                             ui.label(
                                 RichText::new(format!(
-                                    "Indexed {} local media files. Drop GIF/MP4/WebM files to store them locally, or add folders as referenced libraries.",
+                                    "Indexed {} local media files. Drop GIF/MP4/WebM files to store them locally, add folders, or paste a Telegram sticker set link.",
                                     self.media_items.len()
                                 ))
                                 .size(12.0)
@@ -1277,12 +1761,285 @@ impl SymbolisApp {
     }
 }
 
+fn draw_sticker_pack_row(
+    ui: &mut egui::Ui,
+    app: &SymbolisApp,
+    label: &str,
+    count: usize,
+    selected: bool,
+) -> egui::Response {
+    let modern = app.settings.interface_mode.is_modern();
+    let height = if modern { 34.0 } else { 30.0 };
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::click());
+    let row_rect = rect.shrink2(egui::vec2(10.0, 1.0));
+    let palette = app.settings.palette;
+    let hover_t = ui.ctx().animate_bool(response.id, response.hovered());
+    let fill = if selected {
+        blend_color(palette.accent.color(), palette.tile.color(), 0.18)
+    } else {
+        blend_color(palette.panel.color(), palette.tile.color(), hover_t * 0.62)
+    };
+    let stroke = if selected {
+        Stroke::new(1.0, palette.accent.color())
+    } else {
+        Stroke::new(1.0, Color32::TRANSPARENT)
+    };
+
+    ui.painter()
+        .rect(row_rect, Rounding::same(6.0), fill, stroke);
+
+    let count_text = count.to_string();
+    let count_width = (count_text.len() as f32 * 7.0 + 12.0).max(22.0);
+    let label_limit = ((row_rect.width() - count_width - 18.0) / 6.6)
+        .floor()
+        .max(4.0) as usize;
+
+    ui.painter().text(
+        egui::pos2(row_rect.left() + 9.0, row_rect.center().y),
+        Align2::LEFT_CENTER,
+        truncate_chars(label, label_limit),
+        FontId::proportional(if modern { 12.5 } else { 12.0 }),
+        palette.text.color(),
+    );
+    ui.painter().text(
+        egui::pos2(row_rect.right() - 9.0, row_rect.center().y),
+        Align2::RIGHT_CENTER,
+        count_text,
+        FontId::proportional(11.0),
+        palette.muted.color(),
+    );
+
+    response.on_hover_text(format!("{label} ({count})"))
+}
+
+fn draw_dev_metrics(ui: &mut egui::Ui, palette: Palette, snapshot: &DevMetricsSnapshot) {
+    draw_percent_row(ui, palette, "System CPU", snapshot.system_cpu_percent);
+    draw_percent_row(ui, palette, "Process CPU", snapshot.process_cpu_percent);
+
+    ui.add_space(8.0);
+    if let Some(memory) = snapshot.system_memory {
+        draw_bytes_row(
+            ui,
+            palette,
+            "RAM",
+            memory.used_bytes(),
+            memory.total_bytes,
+            Some(memory.used_percent()),
+        );
+    } else {
+        draw_unavailable_row(ui, palette, "RAM");
+    }
+
+    if let Some(memory) = snapshot.process_memory {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Process memory")
+                    .size(12.0)
+                    .color(palette.text.color()),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "RSS {} / virtual {}",
+                        format_bytes(memory.resident_bytes),
+                        format_bytes(memory.virtual_bytes)
+                    ))
+                    .size(12.0)
+                    .color(palette.muted.color()),
+                );
+            });
+        });
+    } else {
+        draw_unavailable_row(ui, palette, "Process memory");
+    }
+
+    ui.add_space(8.0);
+    if snapshot.gpu.is_empty() {
+        ui.label(
+            RichText::new("GPU: unavailable via sysfs")
+                .size(12.0)
+                .color(palette.muted.color()),
+        );
+    } else {
+        for gpu in &snapshot.gpu {
+            draw_gpu_row(ui, palette, gpu);
+        }
+    }
+
+    ui.add_space(8.0);
+    if let Some(storage) = snapshot.media_storage {
+        let suffix = if storage.truncated { " +" } else { "" };
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Local media storage")
+                    .size(12.0)
+                    .color(palette.text.color()),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(
+                    RichText::new(format!("{}{suffix}", format_bytes(storage.bytes)))
+                        .size(12.0)
+                        .color(palette.muted.color()),
+                );
+            });
+        });
+    } else {
+        draw_unavailable_row(ui, palette, "Local media storage");
+    }
+}
+
+fn draw_dev_console(ui: &mut egui::Ui, app: &SymbolisApp, palette: Palette) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Console log")
+                .strong()
+                .color(palette.text.color()),
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(
+                RichText::new(format!(
+                    "jobs {} / scans {}",
+                    app.active_media_job_count(),
+                    app.active_media_scan_count()
+                ))
+                .size(12.0)
+                .color(palette.muted.color()),
+            );
+        });
+    });
+
+    let log_count = app.dev_log_entries().len();
+    if log_count == 0 {
+        ui.label(
+            RichText::new("No events yet")
+                .size(12.0)
+                .color(palette.muted.color()),
+        );
+        return;
+    }
+
+    ScrollArea::vertical()
+        .id_salt("dev_console_log")
+        .max_height(150.0)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for entry in app.dev_log_entries().rev().take(80) {
+                ui.horizontal_top(|ui| {
+                    ui.label(
+                        RichText::new(format_log_time(entry.elapsed_ms))
+                            .size(11.0)
+                            .monospace()
+                            .color(palette.muted.color()),
+                    );
+                    ui.label(
+                        RichText::new(&entry.message)
+                            .size(12.0)
+                            .color(palette.text.color()),
+                    );
+                });
+            }
+        });
+}
+
+fn draw_gpu_row(ui: &mut egui::Ui, palette: Palette, gpu: &GpuMetric) {
+    draw_percent_row(
+        ui,
+        palette,
+        &gpu.label,
+        gpu.usage_percent.map(|value| value as f32),
+    );
+
+    match (gpu.vram_used_bytes, gpu.vram_total_bytes) {
+        (Some(used), Some(total)) => {
+            draw_bytes_row(ui, palette, "VRAM", used, total, gpu.vram_used_percent());
+        }
+        (Some(used), None) => {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("VRAM").size(12.0).color(palette.text.color()));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format_bytes(used))
+                            .size(12.0)
+                            .color(palette.muted.color()),
+                    );
+                });
+            });
+        }
+        _ => {}
+    }
+}
+
+fn draw_percent_row(ui: &mut egui::Ui, palette: Palette, label: &str, value: Option<f32>) {
+    ui.horizontal(|ui| {
+        ui.set_height(24.0);
+        ui.label(RichText::new(label).size(12.0).color(palette.text.color()));
+        let text = value
+            .map(|value| format!("{value:.1}%"))
+            .unwrap_or_else(|| "sampling...".to_owned());
+        let progress = value
+            .map(|value| (value / 100.0).clamp(0.0, 1.0))
+            .unwrap_or(0.0);
+        ui.add_sized(
+            [ui.available_width().max(120.0), 18.0],
+            egui::ProgressBar::new(progress)
+                .text(text)
+                .fill(palette.accent.color()),
+        );
+    });
+}
+
+fn draw_bytes_row(
+    ui: &mut egui::Ui,
+    palette: Palette,
+    label: &str,
+    used: u64,
+    total: u64,
+    percent_value: Option<f32>,
+) {
+    ui.horizontal(|ui| {
+        ui.set_height(24.0);
+        ui.label(RichText::new(label).size(12.0).color(palette.text.color()));
+        let text = if total == 0 {
+            format_bytes(used)
+        } else {
+            format!("{} / {}", format_bytes(used), format_bytes(total))
+        };
+        ui.add_sized(
+            [ui.available_width().max(120.0), 18.0],
+            egui::ProgressBar::new(
+                percent_value
+                    .map(|value| (value / 100.0).clamp(0.0, 1.0))
+                    .unwrap_or(0.0),
+            )
+            .text(text)
+            .fill(palette.accent.color()),
+        );
+    });
+}
+
+fn draw_unavailable_row(ui: &mut egui::Ui, palette: Palette, label: &str) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).size(12.0).color(palette.text.color()));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(
+                RichText::new("unavailable")
+                    .size(12.0)
+                    .color(palette.muted.color()),
+            );
+        });
+    });
+}
+
 fn draw_empty_state(ui: &mut egui::Ui, app: &SymbolisApp, message: &str) {
     ui.centered_and_justified(|ui| {
-        ui.label(
-            RichText::new(message)
-                .size(16.0)
-                .color(app.settings.palette.muted.color()),
+        ui.add(
+            egui::Label::new(
+                RichText::new(message)
+                    .size(16.0)
+                    .color(app.settings.palette.muted.color()),
+            )
+            .wrap(),
         );
     });
 }
@@ -1421,12 +2178,22 @@ fn draw_media_grid(ui: &mut egui::Ui, app: &mut SymbolisApp, filtered: &[MediaIt
                                 ui.close_menu();
                             }
                             ui.separator();
+                            let delete_label = if item.kind == MediaKind::Sticker {
+                                "Delete sticker"
+                            } else {
+                                "Delete file"
+                            };
+                            let delete_hover = if item.kind == MediaKind::Sticker {
+                                "Deletes this sticker file from disk"
+                            } else {
+                                "Deletes this media file from disk"
+                            };
                             if ui
                                 .button(
-                                    RichText::new("Delete file")
+                                    RichText::new(delete_label)
                                         .color(app.settings.palette.danger.color()),
                                 )
-                                .on_hover_text("Deletes this media file from disk")
+                                .on_hover_text(delete_hover)
                                 .clicked()
                             {
                                 app.delete_media_file(&item);
@@ -1764,6 +2531,31 @@ fn truncate_chars(value: &str, limit: usize) -> String {
     } else {
         truncated
     }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f32 = 1024.0;
+    const MIB: f32 = KIB * 1024.0;
+    const GIB: f32 = MIB * 1024.0;
+
+    let bytes = bytes as f32;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.0} KiB", bytes / KIB)
+    } else {
+        format!("{bytes:.0} B")
+    }
+}
+
+fn format_log_time(elapsed_ms: u128) -> String {
+    let total_seconds = elapsed_ms / 1000;
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    let tenths = (elapsed_ms % 1000) / 100;
+    format!("{minutes:02}:{seconds:02}.{tenths}")
 }
 
 fn blend_color(from: Color32, to: Color32, t: f32) -> Color32 {

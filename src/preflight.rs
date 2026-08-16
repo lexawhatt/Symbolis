@@ -1,9 +1,12 @@
 use std::{
-    env, fmt,
+    env, fmt, fs,
     path::{Path, PathBuf},
 };
 
 use arboard::Clipboard;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use crate::{
     emoji_cache::detect_color_emoji_renderer,
@@ -176,16 +179,42 @@ pub(crate) fn run_startup_preflight() -> Result<PreflightReport, PreflightError>
             ));
         }
 
+        if !command_in_path("curl") {
+            warnings.push(StartupWarning::new(
+                "Telegram sticker import",
+                "curl is missing; Telegram sticker set imports will be unavailable.",
+                "Install curl. On Arch-based systems use `sudo pacman -S curl`; on Debian/Ubuntu use `sudo apt install curl`.",
+            ));
+        }
+
         let Some(linux_session) = session else {
             return Err(PreflightError::new(failures));
         };
 
-        if matches!(linux_session, LinuxSession::Wayland { .. }) {
-            warnings.push(StartupWarning::new(
-                "Incoming file drop",
-                "the current winit Wayland backend may not deliver files dropped from file managers into the app.",
-                "For Dolphin/Nautilus drag-in support, run with XWayland/X11 available or set SYMBOLIS_WINDOW_BACKEND=x11. Set SYMBOLIS_WINDOW_BACKEND=wayland only when native Wayland is preferred over file drop.",
-            ));
+        match &linux_session {
+            LinuxSession::Wayland { .. } => {
+                warnings.push(StartupWarning::new(
+                    "Incoming file drop",
+                    "the current winit Wayland backend may not deliver files dropped from file managers into the app.",
+                    "For Dolphin/Nautilus drag-in support, run with XWayland/X11 available or set SYMBOLIS_WINDOW_BACKEND=x11. Set SYMBOLIS_WINDOW_BACKEND=wayland only when native Wayland is preferred over file drop.",
+                ));
+            }
+            LinuxSession::X11 { display } if desktop_session_is_wayland() => {
+                let mut hint = "This is the default on Wayland when DISPLAY is available because XWayland currently gives more reliable file drops. Set SYMBOLIS_WINDOW_BACKEND=wayland to force native Wayland.".to_owned();
+                if !x11_display_has_local_socket(display) {
+                    hint.push_str(
+                        " DISPLAY does not look like a local XWayland socket; if startup fails, install/enable XWayland or force native Wayland.",
+                    );
+                }
+                warnings.push(StartupWarning::new(
+                    "Window backend",
+                    format!(
+                        "using X11/XWayland backend on a Wayland desktop via DISPLAY={display}."
+                    ),
+                    hint,
+                ));
+            }
+            LinuxSession::X11 { .. } => {}
         }
 
         if failures.is_empty() {
@@ -351,6 +380,70 @@ fn runtime_dir_is_usable(path: &Path) -> bool {
     path.is_dir()
 }
 
+#[cfg(target_os = "linux")]
+fn desktop_session_is_wayland() -> bool {
+    env::var("XDG_SESSION_TYPE")
+        .ok()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("wayland"))
+}
+
+#[cfg(target_os = "linux")]
+fn x11_display_has_local_socket(display: &str) -> bool {
+    x11_display_number(display)
+        .map(|number| {
+            Path::new("/tmp/.X11-unix")
+                .join(format!("X{number}"))
+                .exists()
+        })
+        .unwrap_or(true)
+}
+
+#[cfg(target_os = "linux")]
+fn x11_display_number(display: &str) -> Option<&str> {
+    let rest = display.strip_prefix(':')?;
+    let number = rest
+        .split(['.', ' '])
+        .next()
+        .filter(|value| !value.is_empty())?;
+    number
+        .chars()
+        .all(|ch| ch.is_ascii_digit())
+        .then_some(number)
+}
+
+#[cfg(target_os = "linux")]
+fn command_in_path(name: &str) -> bool {
+    env::var_os("PATH")
+        .map(|path| {
+            path.to_string_lossy()
+                .split(':')
+                .filter(|dir| !dir.is_empty())
+                .map(|dir| Path::new(dir).join(name))
+                .any(|path| executable_file(&path))
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode() & 0o111 != 0
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 #[cfg(test)]
 #[cfg(target_os = "linux")]
 mod tests {
@@ -418,5 +511,12 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.iter().any(|check| check.message.contains("DISPLAY")));
+    }
+
+    #[test]
+    fn parses_x11_display_numbers_for_local_socket_checks() {
+        assert_eq!(x11_display_number(":0"), Some("0"));
+        assert_eq!(x11_display_number(":1.0"), Some("1"));
+        assert_eq!(x11_display_number("hostname:0"), None);
     }
 }

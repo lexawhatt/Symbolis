@@ -85,7 +85,9 @@ impl MediaItem {
             .replace(['_', '-'], " ");
         let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let kind = match format {
-            MediaFormat::Gif | MediaFormat::Mp4 | MediaFormat::Webm => MediaKind::Gif,
+            MediaFormat::Gif | MediaFormat::Mp4 => MediaKind::Gif,
+            MediaFormat::Webm if path_looks_like_sticker_storage(&canonical) => MediaKind::Sticker,
+            MediaFormat::Webm => MediaKind::Gif,
             MediaFormat::Png | MediaFormat::Webp => MediaKind::Sticker,
         };
         let modified_at = metadata
@@ -533,6 +535,15 @@ fn same_file(left: &Path, right: &Path) -> bool {
     left == right
 }
 
+fn path_looks_like_sticker_storage(path: &Path) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|part| part.eq_ignore_ascii_case("stickers"))
+    })
+}
+
 fn stable_media_id(path: &Path) -> String {
     let mut hash = 1469598103934665603_u64;
     for byte in path.to_string_lossy().bytes() {
@@ -737,6 +748,21 @@ mod tests {
         assert!(items.iter().any(|item| item.title == "reaction"));
         assert!(items.iter().any(|item| item.title == "clip"));
         assert!(items.iter().any(|item| item.title == "sticker"));
+    }
+
+    #[test]
+    fn webm_under_stickers_is_classified_as_sticker() {
+        let root = unique_test_dir();
+        let stickers = root.join("stickers").join("pack");
+        fs::create_dir_all(&stickers).unwrap();
+        let path = stickers.join("video-sticker.webm");
+        fs::write(&path, b"webm").unwrap();
+
+        let item = MediaItem::from_path(&path).unwrap().unwrap();
+
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(item.kind, MediaKind::Sticker);
     }
 
     #[test]

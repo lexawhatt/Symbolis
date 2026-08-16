@@ -19,11 +19,22 @@ Symbolis performs startup checks before opening the main UI. Missing core deskto
 
 For incoming file drag-and-drop from file managers, Symbolis defaults to X11/XWayland when `DISPLAY` is available, because the current `winit` Linux file-drop implementation is available through its X11 backend. Set `SYMBOLIS_WINDOW_BACKEND=wayland` to force native Wayland, or `SYMBOLIS_WINDOW_BACKEND=x11` to force X11/XWayland.
 
+## Linux Backend Matrix
+
+| Desktop | Recommended mode | Command | Notes |
+| --- | --- | --- | --- |
+| Wayland with XWayland | Auto default | `cargo run` | Best practical default for KDE/GNOME Wayland when `DISPLAY` exists; uses XWayland for more reliable file-manager drops. |
+| Native Wayland | Force Wayland | `SYMBOLIS_WINDOW_BACKEND=wayland cargo run` | Core UI, clipboard, drag-out helper, and media actions work when the compositor exposes clipboard protocols. File drops from file managers may be compositor/toolkit-limited. |
+| X11 | Auto or force X11 | `cargo run` or `SYMBOLIS_WINDOW_BACKEND=x11 cargo run` | Uses the X11 winit backend and X11 clipboard path. |
+
+If both `WAYLAND_DISPLAY` and `DISPLAY` exist, auto mode chooses X11/XWayland intentionally. The System section in Preferences shows the active delivery backend and startup warnings.
+
 ## Optional Runtime Capabilities
 
 - `pango-view` for cached color emoji rendering. Without it, Symbolis still runs and falls back to text-rendered emoji.
 - `dragon-drop` or compatible `mwh/dragon` for file drag-out. Without it, Symbolis still runs and keeps clipboard delivery available.
 - `ffmpeg` for GIF/MP4/WebM conversion. Without it, Symbolis can still reference local files, but cannot save optimized WebM copies or export WebM/MP4 back to GIF for transfer.
+- `curl` for Telegram sticker set imports.
 
 For drag-out, Symbolis checks:
 
@@ -36,13 +47,13 @@ For drag-out, Symbolis checks:
 On Arch-based systems, the practical package set usually includes:
 
 ```bash
-sudo pacman -S pango noto-fonts noto-fonts-emoji ffmpeg
+sudo pacman -S pango noto-fonts noto-fonts-emoji ffmpeg curl xorg-xwayland
 ```
 
 On Debian/Ubuntu-based systems, the practical package set usually includes:
 
 ```bash
-sudo apt install libpango1.0-bin fonts-noto fonts-noto-color-emoji ffmpeg
+sudo apt install libpango1.0-bin fonts-noto fonts-noto-color-emoji ffmpeg curl xwayland
 ```
 
 Install `dragon-drop` or `mwh/dragon` separately if your distribution does not package it.
@@ -65,6 +76,8 @@ The `GIFs` mode is offline-first and does not require paid provider APIs. Symbol
 - paths added in Preferences
 
 Supported local files are `.gif`, `.mp4`, `.m4v`, `.png`, `.webp`, and `.webm`. Drop a supported file onto the app window to store it locally, or add a folder path in Preferences -> Media Sources to reference an existing library without copying it.
+
+Telegram sticker set links can also be pasted into Preferences -> Media Sources, for example `https://t.me/addstickers/EdgyCatboy`. Telegram import requires a free BotFather token saved in Preferences; `SYMBOLIS_TELEGRAM_BOT_TOKEN` is still supported as an environment override. Symbolis uses Telegram Bot API metadata to download static `.webp` stickers and video `.webm` stickers into `~/.local/share/symbolis/media/stickers/telegram/`. Animated `.tgs` stickers are skipped for now.
 
 Clicking a GIF/sticker copies a file-list payload through the system clipboard. Right-clicking a tile exposes explicit file copy, favorite, drag-out, and open-location actions. Drag-out uses `dragon-drop`/`mwh/dragon` when available; without it, file-list clipboard delivery still works.
 
