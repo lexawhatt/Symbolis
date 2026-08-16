@@ -111,13 +111,22 @@ impl LinuxDragHelper {
 
         match self.kind {
             LinuxDragHelperKind::DragonDrop => {
-                command.arg("--and-exit").arg("--on-top");
+                command
+                    .arg("--and-exit")
+                    .arg("--on-top")
+                    .arg("--icon-only")
+                    .arg("--thumb-size")
+                    .arg("96");
                 if files.len() > 1 {
                     command.arg("--all");
                 }
             }
             LinuxDragHelperKind::Dragon => {
-                command.arg("--and-exit");
+                command
+                    .arg("--and-exit")
+                    .arg("--icon-only")
+                    .arg("--thumb-size")
+                    .arg("96");
                 if files.len() > 1 {
                     command.arg("--all");
                 }

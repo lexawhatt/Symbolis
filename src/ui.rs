@@ -1383,7 +1383,7 @@ fn draw_media_grid(ui: &mut egui::Ui, app: &mut SymbolisApp, filtered: &[MediaIt
                             if ui
                                 .add_enabled(
                                     app.drag_out.can_drag_files(),
-                                    Button::new("Start drag"),
+                                    Button::new("Open drag helper"),
                                 )
                                 .clicked()
                             {
@@ -1455,13 +1455,24 @@ fn draw_media_tile(
             blend_color(palette.panel.color(), palette.tile.color(), 0.45),
         ),
     );
-    ui.painter().text(
-        preview_rect.center(),
-        Align2::CENTER_CENTER,
-        item.format.label().to_uppercase(),
-        FontId::proportional(if modern { 24.0 } else { 21.0 }),
-        palette.text.color(),
-    );
+    if let Some(texture) = app.media_preview_cache.texture(ui.ctx(), item) {
+        let image_rect = fit_centered(preview_rect.shrink(3.0), texture.size_vec2());
+        ui.painter().image(
+            texture.id(),
+            image_rect,
+            Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+    } else {
+        ui.painter().text(
+            preview_rect.center(),
+            Align2::CENTER_CENTER,
+            "PREVIEW",
+            FontId::proportional(if modern { 16.0 } else { 14.0 }),
+            palette.muted.color(),
+        );
+    }
+    paint_media_format_badge(ui, preview_rect, item.format.label(), palette.bg.color());
 
     let favorite_rect = media_favorite_rect(rect);
     ui.painter().circle_filled(
@@ -1522,6 +1533,26 @@ fn media_favorite_rect(rect: Rect) -> Rect {
         egui::pos2(rect.right() - 22.0, rect.top() + 22.0),
         egui::vec2(26.0, 26.0),
     )
+}
+
+fn paint_media_format_badge(ui: &egui::Ui, rect: Rect, label: &str, bg: Color32) {
+    let badge_rect = Rect::from_min_size(
+        egui::pos2(rect.left() + 7.0, rect.top() + 7.0),
+        egui::vec2(42.0, 18.0),
+    );
+    ui.painter().rect(
+        badge_rect,
+        Rounding::same(4.0),
+        fade_color(bg, 0.74),
+        Stroke::new(1.0, fade_color(Color32::WHITE, 0.08)),
+    );
+    ui.painter().text(
+        badge_rect.center(),
+        Align2::CENTER_CENTER,
+        label.to_ascii_uppercase(),
+        FontId::proportional(10.5),
+        Color32::WHITE,
+    );
 }
 
 fn status_is_error(status: &str) -> bool {

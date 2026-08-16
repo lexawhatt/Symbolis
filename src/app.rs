@@ -18,6 +18,7 @@ use crate::{
         save_gif_as_webm, save_media_index, save_recent_media, scan_media_library,
         store_media_file_for_library,
     },
+    media_preview::MediaPreviewCache,
     preflight::{PreflightReport, StartupWarning},
     settings::{
         UiSettings, configure_fonts, configure_style, load_settings, save_settings, settings_path,
@@ -118,6 +119,7 @@ pub(crate) struct SymbolisApp {
     pub(crate) data_source: DataSource,
     pub(crate) settings: UiSettings,
     pub(crate) emoji_cache: EmojiCache,
+    pub(crate) media_preview_cache: MediaPreviewCache,
 }
 
 impl SymbolisApp {
@@ -171,6 +173,7 @@ impl SymbolisApp {
             data_source,
             settings,
             emoji_cache: EmojiCache::new(preflight.color_emoji_renderer),
+            media_preview_cache: MediaPreviewCache::new(),
         }
     }
 
@@ -273,7 +276,7 @@ impl SymbolisApp {
             self.status = Some(format!("Recent media save error: {err}"));
             return;
         }
-        self.status = Some(format!("Drag ready: {}", item.title));
+        self.status = Some(format!("Drag helper opened: {}", item.title));
     }
 
     pub(crate) fn save_optimized_media_copy(&mut self, item: &MediaItem) {

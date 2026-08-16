@@ -5,6 +5,7 @@ mod gif_provider;
 mod media_clipboard;
 mod media_drag;
 mod media_library;
+mod media_preview;
 mod preflight;
 mod settings;
 mod ui;
