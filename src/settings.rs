@@ -20,7 +20,8 @@ pub(crate) enum Preset {
     CatppuccinMocha,
     NuarContrastBlack,
     NuarContrastWhite,
-    Custom,
+    #[serde(rename = "Custom")]
+    LegacyCustom,
 }
 
 impl Preset {
@@ -45,9 +46,28 @@ impl Preset {
             Preset::CatppuccinMocha => "Catppuccin Mocha",
             Preset::NuarContrastBlack => "High Contrast Dark",
             Preset::NuarContrastWhite => "High Contrast Light",
-            Preset::Custom => "Custom",
+            Preset::LegacyCustom => "Custom",
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "value")]
+pub(crate) enum ThemeSelection {
+    Preset(Preset),
+    Custom(String),
+}
+
+impl Default for ThemeSelection {
+    fn default() -> Self {
+        Self::Preset(Preset::ModernDark)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct CustomTheme {
+    pub(crate) name: String,
+    pub(crate) palette: Palette,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -79,7 +99,7 @@ impl InterfaceMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct Rgb([u8; 3]);
 
 impl Rgb {
@@ -96,7 +116,7 @@ impl Rgb {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct Palette {
     pub(crate) bg: Rgb,
     pub(crate) panel: Rgb,
@@ -115,6 +135,10 @@ pub(crate) struct UiSettings {
     pub(crate) interface_mode: InterfaceMode,
     #[serde(default)]
     pub(crate) gif_provider: GifProvider,
+    #[serde(default)]
+    pub(crate) theme: ThemeSelection,
+    #[serde(default)]
+    pub(crate) custom_themes: Vec<CustomTheme>,
     pub(crate) preset: Preset,
     pub(crate) palette: Palette,
     pub(crate) color_emoji: bool,
@@ -135,6 +159,8 @@ impl UiSettings {
         Self {
             interface_mode: InterfaceMode::Modern,
             gif_provider: GifProvider::Local,
+            theme: ThemeSelection::Preset(preset),
+            custom_themes: Vec::new(),
             preset,
             palette: palette_for(preset),
             color_emoji: true,
@@ -150,6 +176,8 @@ impl UiSettings {
         *self = UiSettings::from_preset(preset);
         self.interface_mode = previous.interface_mode;
         self.gif_provider = previous.gif_provider;
+        self.custom_themes = previous.custom_themes;
+        self.theme = ThemeSelection::Preset(preset);
         self.color_emoji = previous.color_emoji;
         self.tile_height = previous.tile_height;
         self.emoji_size = previous.emoji_size;
@@ -162,24 +190,15 @@ impl UiSettings {
             return;
         }
 
-        let previous_preset = self.preset;
         self.interface_mode = mode;
 
         match mode {
             InterfaceMode::Modern => {
-                if previous_preset == Preset::DefaultGray {
-                    self.preset = Preset::ModernDark;
-                    self.palette = palette_for(Preset::ModernDark);
-                }
                 self.tile_height = self.tile_height.max(78.0);
                 self.emoji_size = self.emoji_size.max(32.0);
                 self.symbol_size = self.symbol_size.max(32.0);
             }
             InterfaceMode::RawDev => {
-                if previous_preset == Preset::ModernDark {
-                    self.preset = Preset::DefaultGray;
-                    self.palette = palette_for(Preset::DefaultGray);
-                }
                 self.tile_height = 74.0;
                 self.emoji_size = 30.0;
                 self.symbol_size = 31.0;
@@ -188,8 +207,89 @@ impl UiSettings {
         }
     }
 
-    pub(crate) fn mark_custom(&mut self) {
-        self.preset = Preset::Custom;
+    pub(crate) fn apply_custom_theme(&mut self, name: &str) {
+        let Some(theme) = self.custom_themes.iter().find(|theme| theme.name == name) else {
+            return;
+        };
+
+        self.theme = ThemeSelection::Custom(theme.name.clone());
+        self.palette = theme.palette;
+    }
+
+    pub(crate) fn ensure_editable_theme(&mut self) {
+        match &self.theme {
+            ThemeSelection::Preset(_) => {
+                let name = self.next_custom_theme_name();
+                self.custom_themes.push(CustomTheme {
+                    name: name.clone(),
+                    palette: self.palette,
+                });
+                self.theme = ThemeSelection::Custom(name);
+            }
+            ThemeSelection::Custom(_) => {
+                self.sync_selected_custom_theme();
+            }
+        }
+    }
+
+    pub(crate) fn sync_selected_custom_theme(&mut self) {
+        let ThemeSelection::Custom(name) = &self.theme else {
+            return;
+        };
+
+        if let Some(theme) = self
+            .custom_themes
+            .iter_mut()
+            .find(|theme| theme.name == *name)
+        {
+            theme.palette = self.palette;
+        }
+    }
+
+    pub(crate) fn rename_selected_custom_theme(&mut self, new_name: String) {
+        let new_name = sanitize_theme_name(&new_name);
+        if new_name.is_empty() {
+            return;
+        }
+
+        let ThemeSelection::Custom(current_name) = &self.theme else {
+            return;
+        };
+
+        if self
+            .custom_themes
+            .iter()
+            .any(|theme| theme.name == new_name && theme.name != *current_name)
+        {
+            return;
+        }
+
+        if let Some(theme) = self
+            .custom_themes
+            .iter_mut()
+            .find(|theme| theme.name == *current_name)
+        {
+            theme.name = new_name.clone();
+            self.theme = ThemeSelection::Custom(new_name);
+        }
+    }
+
+    pub(crate) fn selected_custom_theme_name(&self) -> Option<&str> {
+        match &self.theme {
+            ThemeSelection::Custom(name) => Some(name.as_str()),
+            ThemeSelection::Preset(_) => None,
+        }
+    }
+
+    fn next_custom_theme_name(&self) -> String {
+        for index in 1.. {
+            let name = format!("Custom {index}");
+            if self.custom_themes.iter().all(|theme| theme.name != name) {
+                return name;
+            }
+        }
+
+        unreachable!()
     }
 }
 
@@ -205,6 +305,18 @@ pub(crate) fn load_settings(path: &Path) -> Option<UiSettings> {
         let color_emoji = settings.color_emoji;
         settings = UiSettings::default();
         settings.color_emoji = color_emoji;
+    }
+
+    if settings.preset == Preset::LegacyCustom {
+        let name = settings.next_custom_theme_name();
+        settings.custom_themes.push(CustomTheme {
+            name: name.clone(),
+            palette: settings.palette,
+        });
+        settings.theme = ThemeSelection::Custom(name);
+        settings.preset = Preset::ModernDark;
+    } else if !content.contains("\"theme\"") {
+        settings.theme = ThemeSelection::Preset(settings.preset);
     }
 
     Some(settings)
@@ -254,6 +366,10 @@ fn is_dark(color: Color32) -> bool {
         + 0.7152 * f32::from(color.g())
         + 0.0722 * f32::from(color.b());
     luminance < 128.0
+}
+
+fn sanitize_theme_name(value: &str) -> String {
+    value.trim().chars().take(48).collect()
 }
 
 pub(crate) fn configure_fonts(ctx: &Context) {
@@ -306,6 +422,100 @@ pub(crate) fn configure_fonts(ctx: &Context) {
     ctx.set_fonts(fonts);
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interface_mode_does_not_change_selected_theme_or_palette() {
+        let mut settings = UiSettings::from_preset(Preset::CatppuccinMocha);
+        let palette = settings.palette;
+
+        settings.apply_interface_mode(InterfaceMode::RawDev);
+
+        assert_eq!(
+            settings.theme,
+            ThemeSelection::Preset(Preset::CatppuccinMocha)
+        );
+        assert_eq!(settings.preset, Preset::CatppuccinMocha);
+        assert_eq!(settings.palette, palette);
+    }
+
+    #[test]
+    fn first_palette_edit_creates_one_named_custom_theme() {
+        let mut settings = UiSettings::from_preset(Preset::ModernDark);
+        settings.palette.accent = Rgb::new(1, 2, 3);
+
+        settings.ensure_editable_theme();
+
+        assert_eq!(settings.custom_themes.len(), 1);
+        assert_eq!(
+            settings.theme,
+            ThemeSelection::Custom("Custom 1".to_owned())
+        );
+        assert_eq!(settings.custom_themes[0].name, "Custom 1");
+        assert_eq!(settings.custom_themes[0].palette, settings.palette);
+    }
+
+    #[test]
+    fn editing_selected_custom_theme_updates_it_in_place() {
+        let mut settings = UiSettings::from_preset(Preset::ModernDark);
+        settings.palette.accent = Rgb::new(1, 2, 3);
+        settings.ensure_editable_theme();
+
+        settings.palette.accent = Rgb::new(4, 5, 6);
+        settings.ensure_editable_theme();
+
+        assert_eq!(settings.custom_themes.len(), 1);
+        assert_eq!(settings.custom_themes[0].palette, settings.palette);
+    }
+
+    #[test]
+    fn selected_custom_theme_can_be_renamed() {
+        let mut settings = UiSettings::from_preset(Preset::ModernDark);
+        settings.palette.accent = Rgb::new(1, 2, 3);
+        settings.ensure_editable_theme();
+
+        settings.rename_selected_custom_theme("My Theme".to_owned());
+
+        assert_eq!(
+            settings.theme,
+            ThemeSelection::Custom("My Theme".to_owned())
+        );
+        assert_eq!(settings.custom_themes[0].name, "My Theme");
+    }
+
+    #[test]
+    fn legacy_custom_preset_loads_as_named_theme() {
+        let mut settings = UiSettings::from_preset(Preset::ModernDark);
+        settings.preset = Preset::LegacyCustom;
+        settings.palette.accent = Rgb::new(9, 8, 7);
+
+        let mut value = serde_json::to_value(&settings).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("theme");
+        object.remove("custom_themes");
+
+        let path = std::env::temp_dir().join(format!(
+            "symbolis-legacy-theme-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+
+        let loaded = load_settings(&path).unwrap();
+        let _ = fs::remove_file(path);
+
+        assert_eq!(loaded.preset, Preset::ModernDark);
+        assert_eq!(loaded.theme, ThemeSelection::Custom("Custom 1".to_owned()));
+        assert_eq!(loaded.custom_themes.len(), 1);
+        assert_eq!(loaded.custom_themes[0].palette.accent, Rgb::new(9, 8, 7));
+    }
+}
+
 fn palette_for(preset: Preset) -> Palette {
     match preset {
         Preset::ModernDark => Palette {
@@ -319,7 +529,7 @@ fn palette_for(preset: Preset) -> Palette {
             muted: Rgb::new(151, 162, 178),
             danger: Rgb::new(255, 111, 125),
         },
-        Preset::DefaultGray | Preset::Custom => Palette {
+        Preset::DefaultGray | Preset::LegacyCustom => Palette {
             bg: Rgb::new(18, 20, 22),
             panel: Rgb::new(35, 38, 42),
             panel_dark: Rgb::new(24, 26, 29),

@@ -8,7 +8,7 @@ use crate::{
     app::{SymbolisApp, Tab},
     data::{Category, DataSource, EmojiGroup, Entry},
     gif_provider::{GifProvider, ProviderStatus},
-    settings::{InterfaceMode, Preset, Rgb},
+    settings::{InterfaceMode, Preset, Rgb, ThemeSelection},
 };
 
 const SIDEBAR_WIDTH: f32 = 56.0;
@@ -630,6 +630,7 @@ impl SymbolisApp {
     fn draw_settings(&mut self, ui: &mut egui::Ui, ctx: &Context) {
         let mut changed = false;
         let mut manual_changed = false;
+        let mut theme_changed = false;
 
         ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -664,7 +665,8 @@ impl SymbolisApp {
                             ui.add_space(10.0);
                             ui.horizontal_wrapped(|ui| {
                                 for preset in Preset::CHOICES {
-                                    let selected = self.settings.preset == preset;
+                                    let selected =
+                                        self.settings.theme == ThemeSelection::Preset(preset);
                                     let button = Button::new(
                                         RichText::new(preset.label())
                                             .color(self.settings.palette.text.color()),
@@ -681,6 +683,60 @@ impl SymbolisApp {
                                     }
                                 }
                             });
+
+                            if !self.settings.custom_themes.is_empty() {
+                                ui.add_space(10.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    let themes: Vec<String> = self
+                                        .settings
+                                        .custom_themes
+                                        .iter()
+                                        .map(|theme| theme.name.clone())
+                                        .collect();
+                                    for name in themes {
+                                        let selected = self.settings.theme
+                                            == ThemeSelection::Custom(name.clone());
+                                        let button = Button::new(
+                                            RichText::new(&name)
+                                                .color(self.settings.palette.text.color()),
+                                        )
+                                        .fill(if selected {
+                                            self.settings.palette.accent.color()
+                                        } else {
+                                            self.settings.palette.tile.color()
+                                        });
+
+                                        if ui.add(button).clicked() {
+                                            self.settings.apply_custom_theme(&name);
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                            }
+
+                            if let Some(name) = self
+                                .settings
+                                .selected_custom_theme_name()
+                                .map(str::to_owned)
+                            {
+                                ui.add_space(10.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new("Name")
+                                            .size(12.0)
+                                            .color(self.settings.palette.muted.color()),
+                                    );
+                                    let mut editable_name = name.clone();
+                                    let response = ui.add_sized(
+                                        [180.0, 28.0],
+                                        TextEdit::singleline(&mut editable_name),
+                                    );
+                                    if response.changed() && editable_name != name {
+                                        self.settings.rename_selected_custom_theme(editable_name);
+                                        changed = true;
+                                    }
+                                });
+                            }
 
                             ui.add_space(10.0);
                             if ui
@@ -742,30 +798,30 @@ impl SymbolisApp {
                                 .spacing([18.0, 10.0])
                                 .striped(false)
                                 .show(ui, |ui| {
-                                    manual_changed |=
+                                    theme_changed |=
                                         color_row(ui, "Background", &mut self.settings.palette.bg);
-                                    manual_changed |=
+                                    theme_changed |=
                                         color_row(ui, "Surface", &mut self.settings.palette.panel);
                                     ui.end_row();
-                                    manual_changed |= color_row(
+                                    theme_changed |= color_row(
                                         ui,
                                         "Sidebar",
                                         &mut self.settings.palette.panel_dark,
                                     );
-                                    manual_changed |=
+                                    theme_changed |=
                                         color_row(ui, "Tile", &mut self.settings.palette.tile);
                                     ui.end_row();
-                                    manual_changed |= color_row(
+                                    theme_changed |= color_row(
                                         ui,
                                         "Tile hover",
                                         &mut self.settings.palette.tile_hover,
                                     );
-                                    manual_changed |=
+                                    theme_changed |=
                                         color_row(ui, "Accent", &mut self.settings.palette.accent);
                                     ui.end_row();
-                                    manual_changed |=
+                                    theme_changed |=
                                         color_row(ui, "Text", &mut self.settings.palette.text);
-                                    manual_changed |=
+                                    theme_changed |=
                                         color_row(ui, "Muted", &mut self.settings.palette.muted);
                                     ui.end_row();
                                 });
@@ -820,10 +876,11 @@ impl SymbolisApp {
             });
 
         changed |= manual_changed;
+        changed |= theme_changed;
 
         if changed {
-            if manual_changed {
-                self.settings.mark_custom();
+            if theme_changed {
+                self.settings.ensure_editable_theme();
             }
             crate::settings::configure_style(ctx, &self.settings);
             self.save_settings();
