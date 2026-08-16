@@ -171,7 +171,7 @@ pub(crate) fn run_startup_preflight() -> Result<PreflightReport, PreflightError>
         if !detect_media_transcoder() {
             warnings.push(StartupWarning::new(
                 "Media conversion",
-                "ffmpeg is missing; WebM/GIF conversion actions will be unavailable.",
+                "ffmpeg is missing; GIF/MP4/WebM conversion actions will be unavailable.",
                 "Install ffmpeg. On Arch-based systems use `sudo pacman -S ffmpeg`; on Debian/Ubuntu use `sudo apt install ffmpeg`.",
             ));
         }

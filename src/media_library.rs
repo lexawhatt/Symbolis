@@ -27,6 +27,7 @@ impl MediaKind {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) enum MediaFormat {
     Gif,
+    Mp4,
     Png,
     Webp,
     Webm,
@@ -36,6 +37,7 @@ impl MediaFormat {
     pub(crate) fn label(self) -> &'static str {
         match self {
             MediaFormat::Gif => "gif",
+            MediaFormat::Mp4 => "mp4",
             MediaFormat::Png => "png",
             MediaFormat::Webp => "webp",
             MediaFormat::Webm => "webm",
@@ -45,6 +47,7 @@ impl MediaFormat {
     pub(crate) fn mime(self) -> &'static str {
         match self {
             MediaFormat::Gif => "image/gif",
+            MediaFormat::Mp4 => "video/mp4",
             MediaFormat::Png => "image/png",
             MediaFormat::Webp => "image/webp",
             MediaFormat::Webm => "video/webm",
@@ -82,7 +85,7 @@ impl MediaItem {
             .replace(['_', '-'], " ");
         let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let kind = match format {
-            MediaFormat::Gif | MediaFormat::Webm => MediaKind::Gif,
+            MediaFormat::Gif | MediaFormat::Mp4 | MediaFormat::Webm => MediaKind::Gif,
             MediaFormat::Png | MediaFormat::Webp => MediaKind::Sticker,
         };
         let modified_at = metadata
@@ -205,12 +208,12 @@ pub(crate) fn save_media_index(path: Option<&Path>, items: &[MediaItem]) -> io::
     write_json(path, items)
 }
 
-pub(crate) fn save_gif_as_webm(item: &MediaItem) -> Result<PathBuf, MediaTranscodeError> {
-    if item.format != MediaFormat::Gif {
+pub(crate) fn save_media_as_webm(item: &MediaItem) -> Result<PathBuf, MediaTranscodeError> {
+    if !matches!(item.format, MediaFormat::Gif | MediaFormat::Mp4) {
         return Err(MediaTranscodeError::UnsupportedFormat(item.format));
     }
 
-    save_gif_path_as_webm(&item.path)
+    save_video_path_as_webm(&item.path)
 }
 
 pub(crate) fn store_media_file_for_library(path: &Path) -> Result<PathBuf, MediaTranscodeError> {
@@ -223,13 +226,13 @@ pub(crate) fn store_media_file_for_library(path: &Path) -> Result<PathBuf, Media
     }
 
     match format {
-        MediaFormat::Gif => save_gif_path_as_webm(path),
+        MediaFormat::Gif | MediaFormat::Mp4 => save_video_path_as_webm(path),
         MediaFormat::Webm => copy_file_to_optimized_storage(path, MediaFormat::Webm),
         MediaFormat::Png | MediaFormat::Webp => copy_file_to_saved_storage(path, format),
     }
 }
 
-fn save_gif_path_as_webm(path: &Path) -> Result<PathBuf, MediaTranscodeError> {
+fn save_video_path_as_webm(path: &Path) -> Result<PathBuf, MediaTranscodeError> {
     let dir = optimized_media_dir().ok_or(MediaTranscodeError::MissingStorageRoot)?;
     fs::create_dir_all(&dir)?;
     let output = content_addressed_storage_path(path, &dir, "webm")?;
@@ -263,7 +266,7 @@ fn save_gif_path_as_webm(path: &Path) -> Result<PathBuf, MediaTranscodeError> {
 
 pub(crate) fn export_media_for_transfer(item: &MediaItem) -> Result<PathBuf, MediaTranscodeError> {
     match item.format {
-        MediaFormat::Webm => export_webm_to_gif(item),
+        MediaFormat::Mp4 | MediaFormat::Webm => export_video_to_gif(item),
         MediaFormat::Gif | MediaFormat::Png | MediaFormat::Webp => Ok(item.path.clone()),
     }
 }
@@ -275,7 +278,7 @@ pub(crate) fn detect_media_transcoder() -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
-fn export_webm_to_gif(item: &MediaItem) -> Result<PathBuf, MediaTranscodeError> {
+fn export_video_to_gif(item: &MediaItem) -> Result<PathBuf, MediaTranscodeError> {
     let dir = export_media_dir().ok_or(MediaTranscodeError::MissingStorageRoot)?;
     fs::create_dir_all(&dir)?;
     let output = dir.join(format!("{}.gif", item.id));
@@ -373,6 +376,7 @@ fn scan_path(path: &Path, seen: &mut HashSet<PathBuf>, items: &mut Vec<MediaItem
 fn media_format(path: &Path) -> Option<MediaFormat> {
     match path.extension()?.to_str()?.to_lowercase().as_str() {
         "gif" => Some(MediaFormat::Gif),
+        "mp4" | "m4v" => Some(MediaFormat::Mp4),
         "png" => Some(MediaFormat::Png),
         "webp" => Some(MediaFormat::Webp),
         "webm" => Some(MediaFormat::Webm),
@@ -545,7 +549,7 @@ impl std::fmt::Display for MediaTranscodeError {
             }
             MediaTranscodeError::Io(err) => write!(f, "{err}"),
             MediaTranscodeError::FfmpegMissing => {
-                write!(f, "ffmpeg is required for WebM/GIF conversion")
+                write!(f, "ffmpeg is required for GIF/MP4/WebM conversion")
             }
             MediaTranscodeError::FfmpegFailed(message) => write!(f, "{message}"),
         }
@@ -632,6 +636,14 @@ mod tests {
             media_format(Path::new("saved.webm")),
             Some(MediaFormat::Webm)
         ));
+        assert!(matches!(
+            media_format(Path::new("clip.MP4")),
+            Some(MediaFormat::Mp4)
+        ));
+        assert!(matches!(
+            media_format(Path::new("loop.m4v")),
+            Some(MediaFormat::Mp4)
+        ));
         assert!(media_format(Path::new("notes.txt")).is_none());
     }
 
@@ -683,6 +695,7 @@ mod tests {
         let nested = root.join("nested");
         fs::create_dir_all(&nested).unwrap();
         fs::write(root.join("reaction.gif"), b"gif").unwrap();
+        fs::write(root.join("clip.mp4"), b"mp4").unwrap();
         fs::write(root.join("notes.txt"), b"text").unwrap();
         fs::write(nested.join("sticker.png"), b"png").unwrap();
 
@@ -690,8 +703,9 @@ mod tests {
 
         fs::remove_dir_all(&root).unwrap();
 
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 3);
         assert!(items.iter().any(|item| item.title == "reaction"));
+        assert!(items.iter().any(|item| item.title == "clip"));
         assert!(items.iter().any(|item| item.title == "sticker"));
     }
 

@@ -1,9 +1,12 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{self, BufReader},
     path::{Path, PathBuf},
     process::Command,
+    sync::mpsc::{self, Receiver, Sender},
+    thread,
+    time::Duration,
 };
 
 use eframe::egui::{ColorImage, Context, TextureHandle, TextureOptions};
@@ -18,24 +21,51 @@ enum CachedMediaPreview {
 pub(crate) struct MediaPreviewCache {
     dir: Option<PathBuf>,
     textures: HashMap<String, CachedMediaPreview>,
+    in_flight: HashSet<String>,
+    job_tx: Sender<PreviewJobRequest>,
+    result_rx: Receiver<PreviewJobResult>,
+}
+
+enum PreviewJobRequest {
+    Render {
+        key: String,
+        input: PathBuf,
+        output: PathBuf,
+    },
+}
+
+enum PreviewJobResult {
+    Ready { key: String, path: PathBuf },
+    Failed { key: String },
 }
 
 impl MediaPreviewCache {
     pub(crate) fn new() -> Self {
+        let (job_tx, result_rx) = spawn_preview_worker();
         Self {
             dir: dirs::cache_dir().map(|dir| dir.join("symbolis").join("media-thumbs")),
             textures: HashMap::new(),
+            in_flight: HashSet::new(),
+            job_tx,
+            result_rx,
         }
     }
 
     pub(crate) fn texture(&mut self, ctx: &Context, item: &MediaItem) -> Option<&TextureHandle> {
+        self.drain_completed(ctx);
+
         let key = preview_cache_key(item);
         if !self.textures.contains_key(&key) {
-            let cached = self
-                .render_or_load(ctx, item, &key)
-                .map(CachedMediaPreview::Ready)
-                .unwrap_or(CachedMediaPreview::Failed);
-            self.textures.insert(key.clone(), cached);
+            if let Some(texture) = self.load_cached_texture(ctx, &key) {
+                self.textures
+                    .insert(key.clone(), CachedMediaPreview::Ready(texture));
+            } else {
+                self.queue_thumbnail_job(&key, item);
+            }
+        }
+
+        if self.in_flight.contains(&key) {
+            ctx.request_repaint_after(Duration::from_millis(120));
         }
 
         match self.textures.get(&key) {
@@ -44,22 +74,106 @@ impl MediaPreviewCache {
         }
     }
 
-    fn render_or_load(&self, ctx: &Context, item: &MediaItem, key: &str) -> Option<TextureHandle> {
-        let dir = self.dir.as_ref()?;
-        fs::create_dir_all(dir).ok()?;
+    fn drain_completed(&mut self, ctx: &Context) {
+        let mut updated = false;
 
-        let path = dir.join(format!("{key}.png"));
-        if !path.exists() && !render_media_thumbnail(&item.path, &path) {
-            return None;
+        while let Ok(result) = self.result_rx.try_recv() {
+            match result {
+                PreviewJobResult::Ready { key, path } => {
+                    self.in_flight.remove(&key);
+                    let cached = load_texture(ctx, &key, &path)
+                        .map(CachedMediaPreview::Ready)
+                        .unwrap_or(CachedMediaPreview::Failed);
+                    self.textures.insert(key, cached);
+                }
+                PreviewJobResult::Failed { key } => {
+                    self.in_flight.remove(&key);
+                    self.textures.insert(key, CachedMediaPreview::Failed);
+                }
+            }
+            updated = true;
         }
 
-        let image = load_png_color_image(&path).ok()?;
-        Some(ctx.load_texture(
-            format!("symbolis-media-{key}"),
-            image,
-            TextureOptions::LINEAR,
-        ))
+        if updated {
+            ctx.request_repaint();
+        }
     }
+
+    fn load_cached_texture(&self, ctx: &Context, key: &str) -> Option<TextureHandle> {
+        let path = self.cached_png_path(key)?;
+        if !path.exists() {
+            return None;
+        }
+        load_texture(ctx, key, &path)
+    }
+
+    fn queue_thumbnail_job(&mut self, key: &str, item: &MediaItem) {
+        if self.in_flight.contains(key) {
+            return;
+        }
+
+        let Some(output) = self.cached_png_path(key) else {
+            self.textures
+                .insert(key.to_owned(), CachedMediaPreview::Failed);
+            return;
+        };
+
+        let input = item.path.clone();
+        let key = key.to_owned();
+        self.in_flight.insert(key.clone());
+        let request = PreviewJobRequest::Render {
+            key: key.clone(),
+            input,
+            output,
+        };
+        if self.job_tx.send(request).is_err() {
+            self.in_flight.remove(key.as_str());
+            self.textures.insert(key, CachedMediaPreview::Failed);
+        }
+    }
+
+    fn cached_png_path(&self, key: &str) -> Option<PathBuf> {
+        let dir = self.dir.as_ref()?;
+        fs::create_dir_all(dir).ok()?;
+        Some(dir.join(format!("{key}.png")))
+    }
+}
+
+fn spawn_preview_worker() -> (Sender<PreviewJobRequest>, Receiver<PreviewJobResult>) {
+    let (job_tx, job_rx) = mpsc::channel::<PreviewJobRequest>();
+    let (result_tx, result_rx) = mpsc::channel::<PreviewJobResult>();
+
+    thread::spawn(move || {
+        while let Ok(job) = job_rx.recv() {
+            if result_tx.send(run_preview_job(job)).is_err() {
+                break;
+            }
+        }
+    });
+
+    (job_tx, result_rx)
+}
+
+fn run_preview_job(job: PreviewJobRequest) -> PreviewJobResult {
+    match job {
+        PreviewJobRequest::Render { key, input, output } => {
+            if render_media_thumbnail(&input, &output) {
+                PreviewJobResult::Ready { key, path: output }
+            } else {
+                let _ = fs::remove_file(output);
+                PreviewJobResult::Failed { key }
+            }
+        }
+    }
+}
+
+fn load_texture(ctx: &Context, key: &str, path: &Path) -> Option<TextureHandle> {
+    let image = load_png_color_image(path).ok()?;
+    Some(ctx.load_texture(
+        format!("symbolis-media-{key}"),
+        image,
+        TextureOptions::LINEAR,
+    ))
 }
 
 fn render_media_thumbnail(input: &Path, output: &Path) -> bool {

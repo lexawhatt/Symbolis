@@ -219,7 +219,7 @@ impl SymbolisApp {
                         if filtered.is_empty() {
                             let message = match self.media_view {
                                 MediaView::Library if self.media_items.is_empty() => {
-                                    "Drop GIFs or WebM here"
+                                    "Drop GIFs, MP4, or WebM here"
                                 }
                                 MediaView::Library => "No media matches",
                                 MediaView::Favorites => "No favorites yet",
@@ -758,7 +758,7 @@ impl SymbolisApp {
             rect.center(),
             Align2::CENTER_CENTER,
             if supported == 0 {
-                "Drop GIF, PNG, WebP, WebM, or a folder"
+                "Drop GIF, MP4, PNG, WebP, WebM, or a folder"
             } else {
                 "Drop to add to GIF library"
             },
@@ -1044,7 +1044,7 @@ impl SymbolisApp {
                                 let response = ui.add_sized(
                                     [ui.available_width().min(420.0), 28.0],
                                     TextEdit::singleline(&mut self.gif_import_path_input)
-                                        .hint_text("/path/to/folder or /path/to/file.webm"),
+                                        .hint_text("/path/to/folder or /path/to/file.mp4"),
                                 );
 
                                 if ui
@@ -1083,7 +1083,7 @@ impl SymbolisApp {
                             ui.add_space(8.0);
                             ui.label(
                                 RichText::new(format!(
-                                    "Indexed {} local media files. Drop GIF/WebM files to store them locally, or add folders as referenced libraries.",
+                                    "Indexed {} local media files. Drop GIF/MP4/WebM files to store them locally, or add folders as referenced libraries.",
                                     self.media_items.len()
                                 ))
                                 .size(12.0)
@@ -1361,7 +1361,7 @@ fn draw_media_grid(ui: &mut egui::Ui, app: &mut SymbolisApp, filtered: &[MediaIt
                             }
                             if ui
                                 .add_enabled(
-                                    item.format == MediaFormat::Gif,
+                                    matches!(item.format, MediaFormat::Gif | MediaFormat::Mp4),
                                     Button::new("Save optimized WebM"),
                                 )
                                 .on_hover_text(
@@ -1392,6 +1392,18 @@ fn draw_media_grid(ui: &mut egui::Ui, app: &mut SymbolisApp, filtered: &[MediaIt
                             }
                             if ui.button("Open location").clicked() {
                                 app.open_media_location(item);
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if ui
+                                .button(
+                                    RichText::new("Delete file")
+                                        .color(app.settings.palette.danger.color()),
+                                )
+                                .on_hover_text("Deletes this media file from disk")
+                                .clicked()
+                            {
+                                app.delete_media_file(item);
                                 ui.close_menu();
                             }
                         });
@@ -1472,8 +1484,6 @@ fn draw_media_tile(
             palette.muted.color(),
         );
     }
-    paint_media_format_badge(ui, preview_rect, item.format.label(), palette.bg.color());
-
     let favorite_rect = media_favorite_rect(rect);
     ui.painter().circle_filled(
         favorite_rect.center(),
@@ -1515,7 +1525,7 @@ fn draw_media_tile(
         palette.muted.color(),
     );
 
-    let transfer_hint = if item.format == MediaFormat::Webm {
+    let transfer_hint = if matches!(item.format, MediaFormat::Mp4 | MediaFormat::Webm) {
         "Click exports GIF for clipboard; right-click for drag."
     } else {
         "Click copies the file; right-click for drag."
@@ -1533,26 +1543,6 @@ fn media_favorite_rect(rect: Rect) -> Rect {
         egui::pos2(rect.right() - 22.0, rect.top() + 22.0),
         egui::vec2(26.0, 26.0),
     )
-}
-
-fn paint_media_format_badge(ui: &egui::Ui, rect: Rect, label: &str, bg: Color32) {
-    let badge_rect = Rect::from_min_size(
-        egui::pos2(rect.left() + 7.0, rect.top() + 7.0),
-        egui::vec2(42.0, 18.0),
-    );
-    ui.painter().rect(
-        badge_rect,
-        Rounding::same(4.0),
-        fade_color(bg, 0.74),
-        Stroke::new(1.0, fade_color(Color32::WHITE, 0.08)),
-    );
-    ui.painter().text(
-        badge_rect.center(),
-        Align2::CENTER_CENTER,
-        label.to_ascii_uppercase(),
-        FontId::proportional(10.5),
-        Color32::WHITE,
-    );
 }
 
 fn status_is_error(status: &str) -> bool {

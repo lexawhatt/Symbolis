@@ -23,7 +23,7 @@ For incoming file drag-and-drop from file managers, Symbolis defaults to X11/XWa
 
 - `pango-view` for cached color emoji rendering. Without it, Symbolis still runs and falls back to text-rendered emoji.
 - `dragon-drop` or compatible `mwh/dragon` for file drag-out. Without it, Symbolis still runs and keeps clipboard delivery available.
-- `ffmpeg` for GIF/WebM conversion. Without it, Symbolis can still reference local files, but cannot save optimized WebM copies or export WebM back to GIF for transfer.
+- `ffmpeg` for GIF/MP4/WebM conversion. Without it, Symbolis can still reference local files, but cannot save optimized WebM copies or export WebM/MP4 back to GIF for transfer.
 
 For drag-out, Symbolis checks:
 
@@ -64,7 +64,7 @@ The `GIFs` mode is offline-first and does not require paid provider APIs. Symbol
 - common `GIFs` / `Stickers` folders under Pictures
 - paths added in Preferences
 
-Supported local files are `.gif`, `.png`, `.webp`, and `.webm`. Drop a supported file onto the app window to store it locally, or add a folder path in Preferences -> Media Sources to reference an existing library without copying it.
+Supported local files are `.gif`, `.mp4`, `.m4v`, `.png`, `.webp`, and `.webm`. Drop a supported file onto the app window to store it locally, or add a folder path in Preferences -> Media Sources to reference an existing library without copying it.
 
 Clicking a GIF/sticker copies a file-list payload through the system clipboard. Right-clicking a tile exposes explicit file copy, favorite, drag-out, and open-location actions. Drag-out uses `dragon-drop`/`mwh/dragon` when available; without it, file-list clipboard delivery still works.
 
@@ -76,12 +76,12 @@ Symbolis does not store user GIFs inside the project/repository. The project tre
 
 Folder imports are zero-copy by default: the app stores paths and metadata in small JSON files, then reads the original files from their existing locations. This avoids doubling disk use for large libraries.
 
-Individual dropped/saved GIF files are stored as WebM under `~/.local/share/symbolis/media/optimized/` using content-addressed names, so identical files deduplicate. When that WebM item is copied or dragged out, Symbolis exports a GIF into `~/.local/share/symbolis/media/exports/` and transfers that GIF. The export cache is regeneratable and is not scanned back into the library.
+Individual dropped/saved GIF and MP4 files are stored as WebM under `~/.local/share/symbolis/media/optimized/` using content-addressed names, so identical files deduplicate. When that WebM item is copied or dragged out, Symbolis exports a GIF into `~/.local/share/symbolis/media/exports/` and transfers that GIF. The export cache is regeneratable and is not scanned back into the library.
 
 The intended long-term storage model is:
 
 - referenced local files stay where the user keeps them
-- files explicitly saved from online providers go into `~/.local/share/symbolis/media/`, preferably as WebM for GIF-like animations
+- files explicitly saved from online providers or dropped as GIF/MP4 go into `~/.local/share/symbolis/media/`, preferably as WebM for GIF-like animations
 - saved provider/imported copies use content-addressed names to deduplicate identical files
 - thumbnails/previews are separate cache files and can be regenerated
 - referenced originals are not recompressed by default; optimized saved copies are WebM, with GIF generated only for compatibility on transfer
