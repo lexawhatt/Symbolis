@@ -1,6 +1,7 @@
 mod app;
 mod data;
 mod emoji_cache;
+mod gif_provider;
 mod media_clipboard;
 mod media_drag;
 mod preflight;

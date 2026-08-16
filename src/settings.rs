@@ -8,6 +8,8 @@ use eframe::egui::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::gif_provider::GifProvider;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) enum Preset {
     ModernDark,
@@ -111,6 +113,8 @@ pub(crate) struct Palette {
 pub(crate) struct UiSettings {
     #[serde(default)]
     pub(crate) interface_mode: InterfaceMode,
+    #[serde(default)]
+    pub(crate) gif_provider: GifProvider,
     pub(crate) preset: Preset,
     pub(crate) palette: Palette,
     pub(crate) color_emoji: bool,
@@ -130,6 +134,7 @@ impl UiSettings {
     pub(crate) fn from_preset(preset: Preset) -> Self {
         Self {
             interface_mode: InterfaceMode::Modern,
+            gif_provider: GifProvider::Local,
             preset,
             palette: palette_for(preset),
             color_emoji: true,
@@ -144,6 +149,7 @@ impl UiSettings {
         let previous = self.clone();
         *self = UiSettings::from_preset(preset);
         self.interface_mode = previous.interface_mode;
+        self.gif_provider = previous.gif_provider;
         self.color_emoji = previous.color_emoji;
         self.tile_height = previous.tile_height;
         self.emoji_size = previous.emoji_size;

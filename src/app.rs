@@ -84,7 +84,7 @@ impl SymbolisApp {
             recent_path,
             settings_path,
             clipboard: MediaClipboard::new().expect("clipboard was verified by startup preflight"),
-            drag_out: LinuxDragOutBackend::new(preflight.linux_session),
+            drag_out: LinuxDragOutBackend::new(preflight.linux_session, preflight.drag_helper),
             status: None,
             data_source,
             settings,
@@ -146,11 +146,19 @@ impl SymbolisApp {
 
     pub(crate) fn delivery_status(&self) -> String {
         let drag = if self.drag_out.can_drag_files() {
-            "native drag ready"
+            format!("drag ready via {}", self.drag_out.helper_label())
         } else {
-            "file clipboard ready"
+            "file clipboard ready".to_owned()
         };
         format!("{} delivery: {drag}", self.drag_out.session_label())
+    }
+
+    pub(crate) fn gif_provider_status(&self) -> String {
+        format!(
+            "{} GIFs: {}",
+            self.settings.gif_provider.label(),
+            self.settings.gif_provider.status().label()
+        )
     }
 
     fn active_entries(&self) -> &[Entry] {

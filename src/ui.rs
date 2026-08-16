@@ -7,6 +7,7 @@ use eframe::egui::{
 use crate::{
     app::{SymbolisApp, Tab},
     data::{Category, DataSource, EmojiGroup, Entry},
+    gif_provider::{GifProvider, ProviderStatus},
     settings::{InterfaceMode, Preset, Rgb},
 };
 
@@ -615,6 +616,13 @@ impl SymbolisApp {
                             .size(12.0)
                             .color(self.settings.palette.muted.color()),
                     );
+
+                    ui.separator();
+                    ui.label(
+                        RichText::new(self.gif_provider_status())
+                            .size(12.0)
+                            .color(self.settings.palette.muted.color()),
+                    );
                 });
             });
     }
@@ -683,6 +691,48 @@ impl SymbolisApp {
                                 changed = true;
                                 manual_changed = true;
                             }
+                        });
+
+                        ui.add_space(12.0);
+                        settings_panel(ui, "Media Sources", self.settings.palette, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                for provider in GifProvider::CHOICES {
+                                    let selected = self.settings.gif_provider == provider;
+                                    let button = Button::new(
+                                        RichText::new(provider.label())
+                                            .color(self.settings.palette.text.color()),
+                                    )
+                                    .fill(if selected {
+                                        self.settings.palette.accent.color()
+                                    } else {
+                                        self.settings.palette.tile.color()
+                                    });
+
+                                    if ui
+                                        .add(button)
+                                        .on_hover_text(provider.description())
+                                        .clicked()
+                                    {
+                                        self.settings.gif_provider = provider;
+                                        changed = true;
+                                    }
+                                }
+                            });
+
+                            ui.add_space(10.0);
+                            let provider = self.settings.gif_provider;
+                            let status = provider.status();
+                            let status_color = match status {
+                                ProviderStatus::Ready(_) => self.settings.palette.muted.color(),
+                                ProviderStatus::MissingApiKey(_) => {
+                                    self.settings.palette.danger.color()
+                                }
+                            };
+                            ui.label(
+                                RichText::new(format!("{}: {}", provider.label(), status.label()))
+                                    .size(12.0)
+                                    .color(status_color),
+                            );
                         });
 
                         ui.add_space(12.0);

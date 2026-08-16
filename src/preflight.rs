@@ -5,9 +5,12 @@ use std::{
 
 use arboard::Clipboard;
 
+use crate::media_drag::{LinuxDragHelper, detect_linux_drag_helper};
+
 #[derive(Clone, Debug)]
 pub(crate) struct PreflightReport {
     pub(crate) linux_session: LinuxSession,
+    pub(crate) drag_helper: LinuxDragHelper,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -113,12 +116,27 @@ pub(crate) fn run_startup_preflight() -> Result<PreflightReport, PreflightError>
             ));
         }
 
+        let drag_helper = match detect_linux_drag_helper() {
+            Ok(helper) => Some(helper),
+            Err(err) => {
+                failures.push(FailedCheck::new(err.to_string(), err.install_hint()));
+                None
+            }
+        };
+
         let Some(linux_session) = session else {
             return Err(PreflightError::new(failures));
         };
 
+        let Some(drag_helper) = drag_helper else {
+            return Err(PreflightError::new(failures));
+        };
+
         if failures.is_empty() {
-            Ok(PreflightReport { linux_session })
+            Ok(PreflightReport {
+                linux_session,
+                drag_helper,
+            })
         } else {
             Err(PreflightError::new(failures))
         }
