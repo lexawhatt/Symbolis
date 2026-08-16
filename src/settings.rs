@@ -136,6 +136,8 @@ pub(crate) struct UiSettings {
     #[serde(default)]
     pub(crate) gif_provider: GifProvider,
     #[serde(default)]
+    pub(crate) gif_import_paths: Vec<PathBuf>,
+    #[serde(default)]
     pub(crate) theme: ThemeSelection,
     #[serde(default)]
     pub(crate) custom_themes: Vec<CustomTheme>,
@@ -159,6 +161,7 @@ impl UiSettings {
         Self {
             interface_mode: InterfaceMode::Modern,
             gif_provider: GifProvider::Local,
+            gif_import_paths: Vec::new(),
             theme: ThemeSelection::Preset(preset),
             custom_themes: Vec::new(),
             preset,
@@ -176,6 +179,7 @@ impl UiSettings {
         *self = UiSettings::from_preset(preset);
         self.interface_mode = previous.interface_mode;
         self.gif_provider = previous.gif_provider;
+        self.gif_import_paths = previous.gif_import_paths;
         self.custom_themes = previous.custom_themes;
         self.theme = ThemeSelection::Preset(preset);
         self.color_emoji = previous.color_emoji;

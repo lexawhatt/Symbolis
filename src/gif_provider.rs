@@ -3,7 +3,7 @@ use std::env;
 use serde::{Deserialize, Serialize};
 
 const GIPHY_API_KEY_ENV: &str = "SYMBOLIS_GIPHY_API_KEY";
-const TENOR_API_KEY_ENV: &str = "SYMBOLIS_TENOR_API_KEY";
+const KLIPY_API_KEY_ENV: &str = "SYMBOLIS_KLIPY_API_KEY";
 const DEFAULT_CLIENT_KEY: &str = "symbolis";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -11,18 +11,19 @@ pub(crate) enum GifProvider {
     #[default]
     Local,
     Giphy,
-    Tenor,
+    #[serde(alias = "Tenor")]
+    Klipy,
 }
 
 impl GifProvider {
     pub(crate) const CHOICES: [GifProvider; 3] =
-        [GifProvider::Local, GifProvider::Giphy, GifProvider::Tenor];
+        [GifProvider::Local, GifProvider::Giphy, GifProvider::Klipy];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
             GifProvider::Local => "Local library",
             GifProvider::Giphy => "GIPHY",
-            GifProvider::Tenor => "Tenor",
+            GifProvider::Klipy => "Klipy",
         }
     }
 
@@ -30,7 +31,15 @@ impl GifProvider {
         match self {
             GifProvider::Local => "Search saved GIFs and stickers without network requests",
             GifProvider::Giphy => "Search GIPHY when SYMBOLIS_GIPHY_API_KEY is set",
-            GifProvider::Tenor => "Search Tenor v2 when SYMBOLIS_TENOR_API_KEY is set",
+            GifProvider::Klipy => "Search Klipy when SYMBOLIS_KLIPY_API_KEY is set",
+        }
+    }
+
+    pub(crate) fn attribution(self) -> Option<&'static str> {
+        match self {
+            GifProvider::Local => None,
+            GifProvider::Giphy => Some("Powered by GIPHY"),
+            GifProvider::Klipy => Some("Powered by KLIPY"),
         }
     }
 
@@ -38,7 +47,7 @@ impl GifProvider {
         match self {
             GifProvider::Local => None,
             GifProvider::Giphy => Some(GIPHY_API_KEY_ENV),
-            GifProvider::Tenor => Some(TENOR_API_KEY_ENV),
+            GifProvider::Klipy => Some(KLIPY_API_KEY_ENV),
         }
     }
 
@@ -122,7 +131,7 @@ pub(crate) fn build_search_url(
     match provider {
         GifProvider::Local => Err(ProviderUrlError::LocalProvider),
         GifProvider::Giphy => build_giphy_search_url(request, query),
-        GifProvider::Tenor => build_tenor_search_url(request, query),
+        GifProvider::Klipy => build_klipy_search_url(request, query),
     }
 }
 
@@ -145,13 +154,13 @@ fn build_giphy_search_url(
     ))
 }
 
-fn build_tenor_search_url(
+fn build_klipy_search_url(
     request: &GifSearchRequest,
     query: &str,
 ) -> Result<String, ProviderUrlError> {
-    let api_key = provider_api_key(GifProvider::Tenor)?;
+    let api_key = provider_api_key(GifProvider::Klipy)?;
     let mut url = format!(
-        "https://tenor.googleapis.com/v2/search?key={key}&client_key={client_key}&q={query}&limit={limit}&media_filter=tinygif,gif,mp4&contentfilter=medium",
+        "https://api.klipy.com/v2/search?key={key}&client_key={client_key}&q={query}&limit={limit}&media_filter=tinygif,gif,mp4&contentfilter=medium",
         key = encode_query_component(&api_key),
         client_key = DEFAULT_CLIENT_KEY,
         query = encode_query_component(query),
@@ -203,6 +212,25 @@ mod tests {
     #[test]
     fn local_provider_has_no_api_key_requirement() {
         assert_eq!(GifProvider::Local.api_key_env(), None);
+    }
+
+    #[test]
+    fn legacy_tenor_settings_deserialize_as_klipy() {
+        assert_eq!(
+            serde_json::from_str::<GifProvider>("\"Tenor\"").unwrap(),
+            GifProvider::Klipy
+        );
+    }
+
+    #[test]
+    fn klipy_uses_its_own_api_key_env() {
+        assert_eq!(GifProvider::Klipy.api_key_env(), Some(KLIPY_API_KEY_ENV));
+    }
+
+    #[test]
+    fn online_providers_have_attribution() {
+        assert_eq!(GifProvider::Giphy.attribution(), Some("Powered by GIPHY"));
+        assert_eq!(GifProvider::Klipy.attribution(), Some("Powered by KLIPY"));
     }
 
     #[test]

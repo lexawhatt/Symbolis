@@ -8,7 +8,10 @@ use arboard::Clipboard;
 use crate::{
     emoji_cache::detect_color_emoji_renderer,
     media_drag::{LinuxDragHelper, detect_linux_drag_helper},
+    media_library::detect_media_transcoder,
 };
+
+const WINDOW_BACKEND_ENV: &str = "SYMBOLIS_WINDOW_BACKEND";
 
 #[derive(Clone, Debug)]
 pub(crate) struct PreflightReport {
@@ -36,6 +39,14 @@ impl LinuxSession {
             LinuxSession::X11 { .. } => "X11",
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinuxWindowBackendPreference {
+    Auto,
+    X11,
+    Wayland,
 }
 
 #[derive(Clone, Debug)]
@@ -157,9 +168,25 @@ pub(crate) fn run_startup_preflight() -> Result<PreflightReport, PreflightError>
             ));
         }
 
+        if !detect_media_transcoder() {
+            warnings.push(StartupWarning::new(
+                "Media conversion",
+                "ffmpeg is missing; WebM/GIF conversion actions will be unavailable.",
+                "Install ffmpeg. On Arch-based systems use `sudo pacman -S ffmpeg`; on Debian/Ubuntu use `sudo apt install ffmpeg`.",
+            ));
+        }
+
         let Some(linux_session) = session else {
             return Err(PreflightError::new(failures));
         };
+
+        if matches!(linux_session, LinuxSession::Wayland { .. }) {
+            warnings.push(StartupWarning::new(
+                "Incoming file drop",
+                "the current winit Wayland backend may not deliver files dropped from file managers into the app.",
+                "For Dolphin/Nautilus drag-in support, run with XWayland/X11 available or set SYMBOLIS_WINDOW_BACKEND=x11. Set SYMBOLIS_WINDOW_BACKEND=wayland only when native Wayland is preferred over file drop.",
+            ));
+        }
 
         if failures.is_empty() {
             Ok(PreflightReport {
@@ -176,11 +203,14 @@ pub(crate) fn run_startup_preflight() -> Result<PreflightReport, PreflightError>
 
 #[cfg(target_os = "linux")]
 fn detect_linux_session_from_env() -> Result<LinuxSession, Vec<FailedCheck>> {
+    let preference = linux_window_backend_preference_from_env().map_err(|check| vec![check])?;
     detect_linux_session(
         env::var("XDG_SESSION_TYPE").ok().as_deref(),
         env::var("WAYLAND_DISPLAY").ok().as_deref(),
+        env::var("WAYLAND_SOCKET").ok().as_deref(),
         env::var("DISPLAY").ok().as_deref(),
         env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+        preference,
     )
 }
 
@@ -188,8 +218,10 @@ fn detect_linux_session_from_env() -> Result<LinuxSession, Vec<FailedCheck>> {
 fn detect_linux_session(
     xdg_session_type: Option<&str>,
     wayland_display: Option<&str>,
+    wayland_socket: Option<&str>,
     display: Option<&str>,
     xdg_runtime_dir: Option<&str>,
+    preference: LinuxWindowBackendPreference,
 ) -> Result<LinuxSession, Vec<FailedCheck>> {
     let normalized_session = xdg_session_type
         .map(str::trim)
@@ -198,44 +230,40 @@ fn detect_linux_session(
     let wayland_display = wayland_display
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let wayland_socket = wayland_socket
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let display = display.map(str::trim).filter(|value| !value.is_empty());
 
-    if let Some(display) = wayland_display {
-        let Some(runtime_dir) = xdg_runtime_dir
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-        else {
+    match preference {
+        LinuxWindowBackendPreference::X11 => {
+            if let Some(display) = display {
+                return Ok(LinuxSession::X11 {
+                    display: display.to_owned(),
+                });
+            }
             return Err(vec![FailedCheck::new(
-                "WAYLAND_DISPLAY is set, but XDG_RUNTIME_DIR is missing.",
-                "Start Symbolis from your desktop session, not from a stripped environment. XDG_RUNTIME_DIR should point to the active user runtime directory.",
-            )]);
-        };
-
-        if !runtime_dir_is_usable(&runtime_dir) {
-            return Err(vec![FailedCheck::new(
-                format!(
-                    "XDG_RUNTIME_DIR does not exist or is not a directory: {}",
-                    runtime_dir.display()
-                ),
-                "Fix the session environment. On systemd-based desktops this is normally created automatically under /run/user/<uid>.",
+                format!("{WINDOW_BACKEND_ENV}=x11, but DISPLAY is missing."),
+                "Launch Symbolis from an X11/XWayland-capable session, or set SYMBOLIS_WINDOW_BACKEND=wayland.",
             )]);
         }
-
-        return Ok(LinuxSession::Wayland {
-            display: display.to_owned(),
-            runtime_dir,
-        });
-    }
-
-    if let Some(display) = display {
-        return Ok(LinuxSession::X11 {
-            display: display.to_owned(),
-        });
+        LinuxWindowBackendPreference::Wayland => {
+            return detect_wayland_session(wayland_display, wayland_socket, xdg_runtime_dir);
+        }
+        LinuxWindowBackendPreference::Auto => {
+            if let Some(display) = display {
+                return Ok(LinuxSession::X11 {
+                    display: display.to_owned(),
+                });
+            }
+            if wayland_display.is_some() || wayland_socket.is_some() {
+                return detect_wayland_session(wayland_display, wayland_socket, xdg_runtime_dir);
+            }
+        }
     }
 
     let mut failures = vec![FailedCheck::new(
-        "No usable graphical session was detected. WAYLAND_DISPLAY and DISPLAY are both missing.",
+        "No usable graphical session was detected. WAYLAND_DISPLAY, WAYLAND_SOCKET, and DISPLAY are missing.",
         "Launch Symbolis from a running Wayland or X11 desktop session.",
     )];
 
@@ -258,6 +286,67 @@ fn detect_linux_session(
 }
 
 #[cfg(target_os = "linux")]
+fn linux_window_backend_preference_from_env() -> Result<LinuxWindowBackendPreference, FailedCheck> {
+    let Some(value) = env::var(WINDOW_BACKEND_ENV)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(LinuxWindowBackendPreference::Auto);
+    };
+
+    match value.as_str() {
+        "auto" => Ok(LinuxWindowBackendPreference::Auto),
+        "x11" | "x" => Ok(LinuxWindowBackendPreference::X11),
+        "wayland" | "wl" => Ok(LinuxWindowBackendPreference::Wayland),
+        other => Err(FailedCheck::new(
+            format!("{WINDOW_BACKEND_ENV} has unsupported value '{other}'."),
+            "Use SYMBOLIS_WINDOW_BACKEND=auto, x11, or wayland.",
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_wayland_session(
+    wayland_display: Option<&str>,
+    wayland_socket: Option<&str>,
+    xdg_runtime_dir: Option<&str>,
+) -> Result<LinuxSession, Vec<FailedCheck>> {
+    let Some(display) = wayland_display.or(wayland_socket) else {
+        return Err(vec![FailedCheck::new(
+            "Wayland backend was requested, but WAYLAND_DISPLAY and WAYLAND_SOCKET are missing.",
+            "Launch Symbolis from a Wayland session, or set SYMBOLIS_WINDOW_BACKEND=x11 when DISPLAY is available.",
+        )]);
+    };
+
+    let Some(runtime_dir) = xdg_runtime_dir
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    else {
+        return Err(vec![FailedCheck::new(
+            "Wayland backend was selected, but XDG_RUNTIME_DIR is missing.",
+            "Start Symbolis from your desktop session, not from a stripped environment. XDG_RUNTIME_DIR should point to the active user runtime directory.",
+        )]);
+    };
+
+    if !runtime_dir_is_usable(&runtime_dir) {
+        return Err(vec![FailedCheck::new(
+            format!(
+                "XDG_RUNTIME_DIR does not exist or is not a directory: {}",
+                runtime_dir.display()
+            ),
+            "Fix the session environment. On systemd-based desktops this is normally created automatically under /run/user/<uid>.",
+        )]);
+    }
+
+    Ok(LinuxSession::Wayland {
+        display: display.to_owned(),
+        runtime_dir,
+    })
+}
+
+#[cfg(target_os = "linux")]
 fn runtime_dir_is_usable(path: &Path) -> bool {
     path.is_dir()
 }
@@ -270,7 +359,15 @@ mod tests {
     #[test]
     fn detects_x11_from_display() {
         assert_eq!(
-            detect_linux_session(Some("x11"), None, Some(":0"), None).unwrap(),
+            detect_linux_session(
+                Some("x11"),
+                None,
+                None,
+                Some(":0"),
+                None,
+                LinuxWindowBackendPreference::Auto
+            )
+            .unwrap(),
             LinuxSession::X11 {
                 display: ":0".to_owned()
             }
@@ -278,8 +375,48 @@ mod tests {
     }
 
     #[test]
+    fn auto_prefers_x11_when_both_linux_backends_exist() {
+        assert!(matches!(
+            detect_linux_session(
+                Some("wayland"),
+                Some("wayland-0"),
+                None,
+                Some(":0"),
+                Some("/tmp"),
+                LinuxWindowBackendPreference::Auto
+            )
+            .unwrap(),
+            LinuxSession::X11 { .. }
+        ));
+    }
+
+    #[test]
+    fn explicit_wayland_keeps_wayland_when_display_also_exists() {
+        assert!(matches!(
+            detect_linux_session(
+                Some("wayland"),
+                Some("wayland-0"),
+                None,
+                Some(":0"),
+                Some("/tmp"),
+                LinuxWindowBackendPreference::Wayland
+            )
+            .unwrap(),
+            LinuxSession::Wayland { .. }
+        ));
+    }
+
+    #[test]
     fn rejects_missing_display() {
-        let err = detect_linux_session(Some("x11"), None, None, None).unwrap_err();
+        let err = detect_linux_session(
+            Some("x11"),
+            None,
+            None,
+            None,
+            None,
+            LinuxWindowBackendPreference::X11,
+        )
+        .unwrap_err();
         assert!(err.iter().any(|check| check.message.contains("DISPLAY")));
     }
 }

@@ -2936,6 +2936,7 @@ dependencies = [
  "png",
  "serde",
  "serde_json",
+ "winit",
 ]
 
 [[package]]

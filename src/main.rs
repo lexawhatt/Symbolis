@@ -4,12 +4,17 @@ mod emoji_cache;
 mod gif_provider;
 mod media_clipboard;
 mod media_drag;
+mod media_library;
 mod preflight;
 mod settings;
 mod ui;
 
 use app::SymbolisApp;
 use eframe::egui::{self, Align, CentralPanel, Layout, RichText, ViewportBuilder};
+use preflight::LinuxSession;
+
+#[cfg(target_os = "linux")]
+use winit::platform::{wayland::EventLoopBuilderExtWayland, x11::EventLoopBuilderExtX11};
 
 const APP_NAME: &str = "Symbolis";
 
@@ -23,14 +28,7 @@ fn main() -> eframe::Result {
         }
     };
 
-    let options = eframe::NativeOptions {
-        viewport: ViewportBuilder::default()
-            .with_inner_size([680.0, 520.0])
-            .with_min_inner_size([420.0, 360.0])
-            .with_resizable(true)
-            .with_title(APP_NAME),
-        ..Default::default()
-    };
+    let options = native_options(APP_NAME, Some(&preflight.linux_session));
 
     eframe::run_native(
         APP_NAME,
@@ -40,20 +38,59 @@ fn main() -> eframe::Result {
 }
 
 fn run_startup_error_window(message: String) -> eframe::Result {
-    let options = eframe::NativeOptions {
-        viewport: ViewportBuilder::default()
-            .with_inner_size([560.0, 360.0])
-            .with_min_inner_size([420.0, 280.0])
-            .with_resizable(true)
-            .with_title("Symbolis startup check"),
-        ..Default::default()
-    };
+    let mut options = native_options("Symbolis startup check", None);
+    options.viewport = ViewportBuilder::default()
+        .with_inner_size([560.0, 360.0])
+        .with_min_inner_size([420.0, 280.0])
+        .with_resizable(true)
+        .with_title("Symbolis startup check");
 
     eframe::run_native(
         "Symbolis startup check",
         options,
         Box::new(|_| Ok(Box::new(StartupErrorApp { message }))),
     )
+}
+
+fn native_options(title: &str, linux_session: Option<&LinuxSession>) -> eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
+        viewport: ViewportBuilder::default()
+            .with_inner_size([680.0, 520.0])
+            .with_min_inner_size([420.0, 360.0])
+            .with_resizable(true)
+            .with_title(title),
+        ..Default::default()
+    };
+
+    configure_linux_event_loop(&mut options, linux_session);
+    options
+}
+
+#[cfg(target_os = "linux")]
+fn configure_linux_event_loop(
+    options: &mut eframe::NativeOptions,
+    linux_session: Option<&LinuxSession>,
+) {
+    match linux_session {
+        Some(LinuxSession::X11 { .. }) => {
+            options.event_loop_builder = Some(Box::new(|builder| {
+                builder.with_x11();
+            }));
+        }
+        Some(LinuxSession::Wayland { .. }) => {
+            options.event_loop_builder = Some(Box::new(|builder| {
+                builder.with_wayland();
+            }));
+        }
+        None => {}
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_linux_event_loop(
+    _options: &mut eframe::NativeOptions,
+    _linux_session: Option<&LinuxSession>,
+) {
 }
 
 struct StartupErrorApp {

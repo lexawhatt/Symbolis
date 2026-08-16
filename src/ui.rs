@@ -1,13 +1,15 @@
 use eframe::egui::{
-    self, Align, Align2, Button, Color32, Context, FontId, Frame, Layout, Rect, RichText, Rounding,
-    ScrollArea, Sense, Stroke, TextEdit, TopBottomPanel, color_picker::Alpha,
+    self, Align, Align2, Button, Color32, Context, FontId, Frame, Key, Layout, Rect, RichText,
+    Rounding, ScrollArea, Sense, Stroke, TextEdit, TopBottomPanel, color_picker::Alpha,
     containers::scroll_area::ScrollBarVisibility,
 };
 
 use crate::{
-    app::{SymbolisApp, Tab},
+    app::{ContentMode, MediaView, SymbolisApp, Tab, has_hovered_files, hovered_media_drop_count},
     data::{Category, DataSource, EmojiGroup, Entry},
     gif_provider::{GifProvider, ProviderStatus},
+    media_drag::DragOutBackend,
+    media_library::{MediaFormat, MediaItem},
     settings::{InterfaceMode, Preset, Rgb, ThemeSelection},
 };
 
@@ -179,12 +181,19 @@ impl SidebarGroup {
 
 impl SymbolisApp {
     pub(crate) fn draw(&mut self, ctx: &Context) {
-        let filtered = self.filtered_entries();
         let chrome = chrome(self.settings.interface_mode);
+        let count = if self.selected_tab == Tab::Settings {
+            0
+        } else {
+            match self.content_mode {
+                ContentMode::Symbols => self.filtered_entries().len(),
+                ContentMode::Gifs => self.filtered_media_items().len(),
+            }
+        };
 
         self.draw_sidebar(ctx);
         self.draw_topbar(ctx);
-        self.draw_footer(ctx, filtered.len());
+        self.draw_footer(ctx, count);
 
         egui::CentralPanel::default()
             .frame(Frame::none().fill(self.settings.palette.bg.color()))
@@ -194,23 +203,46 @@ impl SymbolisApp {
                     return;
                 }
 
-                if filtered.is_empty() {
-                    ui.centered_and_justified(|ui| {
-                        ui.label(
-                            RichText::new("No matches")
-                                .size(16.0)
-                                .color(self.settings.palette.muted.color()),
-                        );
-                    });
-                    return;
-                }
+                match self.content_mode {
+                    ContentMode::Symbols => {
+                        let filtered = self.filtered_entries();
+                        if filtered.is_empty() {
+                            draw_empty_state(ui, self, "No matches");
+                            return;
+                        }
 
-                ui.add_space(chrome.content_top_space);
-                draw_symbol_grid(ui, self, &filtered);
+                        ui.add_space(chrome.content_top_space);
+                        draw_symbol_grid(ui, self, &filtered);
+                    }
+                    ContentMode::Gifs => {
+                        let filtered = self.filtered_media_items();
+                        if filtered.is_empty() {
+                            let message = match self.media_view {
+                                MediaView::Library if self.media_items.is_empty() => {
+                                    "Drop GIFs or WebM here"
+                                }
+                                MediaView::Library => "No media matches",
+                                MediaView::Favorites => "No favorites yet",
+                                MediaView::RecentlyUsed => "No recently used GIFs yet",
+                            };
+                            draw_empty_state(ui, self, message);
+                            return;
+                        }
+
+                        ui.add_space(chrome.content_top_space);
+                        draw_media_grid(ui, self, &filtered);
+                    }
+                }
             });
+        self.draw_drop_overlay(ctx);
     }
 
     fn draw_sidebar(&mut self, ctx: &Context) {
+        if self.content_mode == ContentMode::Gifs && self.selected_tab != Tab::Settings {
+            self.draw_gif_sidebar(ctx);
+            return;
+        }
+
         let chrome = chrome(self.settings.interface_mode);
 
         egui::SidePanel::left("sidebar")
@@ -237,6 +269,63 @@ impl SymbolisApp {
                     },
                 );
             });
+    }
+
+    fn draw_gif_sidebar(&mut self, ctx: &Context) {
+        let chrome = chrome(self.settings.interface_mode);
+
+        egui::SidePanel::left("gif_sidebar")
+            .resizable(false)
+            .exact_width(chrome.sidebar_width)
+            .frame(Frame::none().fill(self.settings.palette.panel_dark.color()))
+            .show(ctx, |ui| {
+                let nav_height = (ui.available_height() - chrome.sidebar_settings_height).max(0.0);
+
+                ui.allocate_ui_with_layout(
+                    egui::vec2(chrome.sidebar_width, nav_height),
+                    Layout::top_down(Align::Center),
+                    |ui| {
+                        ui.add_space(10.0);
+                        self.media_sidebar_button(ui, MediaView::Library, "GIF", true);
+                        ui.add_space(8.0);
+                        self.media_sidebar_button(ui, MediaView::Favorites, "★", true);
+                        ui.add_space(8.0);
+                        self.media_sidebar_button(ui, MediaView::RecentlyUsed, "↺", true);
+                    },
+                );
+
+                ui.allocate_ui_with_layout(
+                    egui::vec2(chrome.sidebar_width, chrome.sidebar_settings_height),
+                    Layout::bottom_up(Align::Center),
+                    |ui| {
+                        ui.add_space(10.0);
+                        self.sidebar_button(ui, Tab::Settings, true, false, 1.0);
+                    },
+                );
+            });
+    }
+
+    fn media_sidebar_button(
+        &mut self,
+        ui: &mut egui::Ui,
+        view: MediaView,
+        icon: &str,
+        enabled: bool,
+    ) {
+        let response = self.sidebar_icon_button(
+            ui,
+            view.label(),
+            icon,
+            self.media_view == view,
+            enabled,
+            false,
+            false,
+            1.0,
+        );
+
+        if response.clicked() && enabled {
+            self.media_view = view;
+        }
     }
 
     fn draw_sidebar_nav_scroll(&mut self, ui: &mut egui::Ui) {
@@ -523,8 +612,10 @@ impl SymbolisApp {
                 ui.add_space(if modern { 16.0 } else { 13.0 });
                 ui.horizontal(|ui| {
                     ui.add_space(if modern { 18.0 } else { 14.0 });
+                    self.draw_mode_switch(ui);
+                    ui.add_space(8.0);
                     ui.label(
-                        RichText::new(self.selected_tab.label())
+                        RichText::new(self.topbar_title())
                             .size(if modern { 22.0 } else { 20.0 })
                             .strong()
                             .color(self.settings.palette.text.color()),
@@ -533,7 +624,10 @@ impl SymbolisApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.add_space(if modern { 16.0 } else { 12.0 });
 
-                        if self.selected_tab == Tab::Recent && !self.recent.is_empty() {
+                        if self.content_mode == ContentMode::Symbols
+                            && self.selected_tab == Tab::Recent
+                            && !self.recent.is_empty()
+                        {
                             if ui
                                 .button(
                                     RichText::new("Clear")
@@ -547,14 +641,39 @@ impl SymbolisApp {
                             ui.add_space(if modern { 12.0 } else { 10.0 });
                         }
 
+                        if self.content_mode == ContentMode::Gifs
+                            && self.media_view == MediaView::RecentlyUsed
+                            && !self.recent_media.is_empty()
+                        {
+                            if ui
+                                .button(
+                                    RichText::new("Clear")
+                                        .color(self.settings.palette.text.color()),
+                                )
+                                .on_hover_text("Clear recent GIFs")
+                                .clicked()
+                            {
+                                self.clear_recent_media();
+                            }
+                            ui.add_space(if modern { 12.0 } else { 10.0 });
+                        }
+
                         if self.selected_tab != Tab::Settings {
                             let width = ui
                                 .available_width()
                                 .min(if modern { 300.0 } else { 260.0 })
                                 .max(150.0);
+                            let hint = match self.content_mode {
+                                ContentMode::Symbols => "Search symbols...",
+                                ContentMode::Gifs => "Search local GIFs...",
+                            };
+                            let query = match self.content_mode {
+                                ContentMode::Symbols => &mut self.query,
+                                ContentMode::Gifs => &mut self.gif_query,
+                            };
                             let response = ui.add_sized(
                                 [width, if modern { 36.0 } else { 32.0 }],
-                                TextEdit::singleline(&mut self.query).hint_text("Search..."),
+                                TextEdit::singleline(query).hint_text(hint),
                             );
                             response.request_focus();
                         }
@@ -574,6 +693,80 @@ impl SymbolisApp {
             });
     }
 
+    fn draw_mode_switch(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for mode in ContentMode::CHOICES {
+                let selected = self.content_mode == mode && self.selected_tab != Tab::Settings;
+                let button = Button::new(
+                    RichText::new(mode.label())
+                        .size(12.0)
+                        .color(self.settings.palette.text.color()),
+                )
+                .fill(if selected {
+                    self.settings.palette.accent.color()
+                } else {
+                    self.settings.palette.tile.color()
+                });
+
+                if ui.add(button).clicked() {
+                    self.content_mode = mode;
+                    if self.selected_tab == Tab::Settings {
+                        self.selected_tab = Tab::Category(Category::Emoji);
+                    }
+                }
+            }
+        });
+    }
+
+    fn topbar_title(&self) -> &'static str {
+        if self.selected_tab == Tab::Settings {
+            return self.selected_tab.label();
+        }
+
+        match self.content_mode {
+            ContentMode::Symbols => self.selected_tab.label(),
+            ContentMode::Gifs => self.media_view.label(),
+        }
+    }
+
+    fn draw_drop_overlay(&self, ctx: &Context) {
+        if !has_hovered_files(ctx) {
+            return;
+        }
+
+        let supported = hovered_media_drop_count(ctx);
+        let screen = ctx.screen_rect();
+        let rect = screen.shrink2(egui::vec2(28.0, 28.0));
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("media_drop_overlay"),
+        ));
+        let palette = self.settings.palette;
+        let accent = if supported == 0 {
+            palette.danger.color()
+        } else {
+            palette.accent.color()
+        };
+        let fill = fade_color(
+            blend_color(palette.bg.color(), palette.panel.color(), 0.5),
+            0.92,
+        );
+
+        painter.rect(rect, Rounding::same(12.0), fill, Stroke::new(2.0, accent));
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            if supported == 0 {
+                "Drop GIF, PNG, WebP, WebM, or a folder"
+            } else {
+                "Drop to add to GIF library"
+            },
+            FontId::proportional(20.0),
+            self.settings.palette.text.color(),
+        );
+    }
+
     fn draw_footer(&self, ctx: &Context, count: usize) {
         let chrome = chrome(self.settings.interface_mode);
 
@@ -591,44 +784,65 @@ impl SymbolisApp {
 
                     if let Some(status) = &self.status {
                         ui.separator();
-                        let color = if status.starts_with("Copied ") {
-                            self.settings.palette.muted.color()
-                        } else {
+                        let color = if status_is_error(status) {
                             self.settings.palette.danger.color()
+                        } else {
+                            self.settings.palette.muted.color()
                         };
                         ui.label(RichText::new(status).size(12.0).color(color));
                         return;
                     }
 
                     ui.separator();
-                    let source = match &self.data_source {
-                        DataSource::Rofimoji(path) => path.display().to_string(),
-                        DataSource::BuiltIn => "built-in fallback".to_owned(),
-                    };
-                    ui.label(
-                        RichText::new(source)
-                            .size(12.0)
-                            .color(self.settings.palette.muted.color()),
-                    );
+                    match self.content_mode {
+                        ContentMode::Symbols => {
+                            let source = match &self.data_source {
+                                DataSource::Rofimoji(path) => path.display().to_string(),
+                                DataSource::BuiltIn => "built-in fallback".to_owned(),
+                            };
+                            ui.label(
+                                RichText::new(source)
+                                    .size(12.0)
+                                    .color(self.settings.palette.muted.color()),
+                            );
 
-                    ui.separator();
-                    ui.label(
-                        RichText::new(self.delivery_status())
-                            .size(12.0)
-                            .color(self.settings.palette.muted.color()),
-                    );
+                            ui.separator();
+                            ui.label(
+                                RichText::new(self.delivery_status())
+                                    .size(12.0)
+                                    .color(self.settings.palette.muted.color()),
+                            );
 
-                    ui.separator();
-                    let color = if self.emoji_cache.color_renderer_available() {
-                        self.settings.palette.muted.color()
-                    } else {
-                        self.settings.palette.danger.color()
-                    };
-                    ui.label(
-                        RichText::new(self.color_emoji_status())
-                            .size(12.0)
-                            .color(color),
-                    );
+                            ui.separator();
+                            let color = if self.emoji_cache.color_renderer_available() {
+                                self.settings.palette.muted.color()
+                            } else {
+                                self.settings.palette.danger.color()
+                            };
+                            ui.label(
+                                RichText::new(self.color_emoji_status())
+                                    .size(12.0)
+                                    .color(color),
+                            );
+                        }
+                        ContentMode::Gifs => {
+                            ui.label(
+                                RichText::new(format!(
+                                    "local library: {} files",
+                                    self.media_items.len()
+                                ))
+                                .size(12.0)
+                                .color(self.settings.palette.muted.color()),
+                            );
+
+                            ui.separator();
+                            ui.label(
+                                RichText::new(self.delivery_status())
+                                    .size(12.0)
+                                    .color(self.settings.palette.muted.color()),
+                            );
+                        }
+                    }
 
                     ui.separator();
                     ui.label(
@@ -816,6 +1030,92 @@ impl SymbolisApp {
                                     .size(12.0)
                                     .color(status_color),
                             );
+                            if let Some(attribution) = provider.attribution() {
+                                ui.label(
+                                    RichText::new(attribution)
+                                        .size(12.0)
+                                        .strong()
+                                        .color(self.settings.palette.muted.color()),
+                                );
+                            }
+
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
+                                let response = ui.add_sized(
+                                    [ui.available_width().min(420.0), 28.0],
+                                    TextEdit::singleline(&mut self.gif_import_path_input)
+                                        .hint_text("/path/to/folder or /path/to/file.webm"),
+                                );
+
+                                if ui
+                                    .add(
+                                        Button::new(
+                                            RichText::new("Add")
+                                                .color(self.settings.palette.text.color()),
+                                        )
+                                        .fill(self.settings.palette.tile.color()),
+                                    )
+                                    .clicked()
+                                    || (response.lost_focus()
+                                        && ui.input(|input| input.key_pressed(Key::Enter)))
+                                {
+                                    let input = self.gif_import_path_input.trim();
+                                    if !input.is_empty() {
+                                        self.add_media_import_path(input.into());
+                                        self.gif_import_path_input.clear();
+                                    }
+                                }
+
+                                if ui
+                                    .add(
+                                        Button::new(
+                                            RichText::new("Rescan")
+                                                .color(self.settings.palette.text.color()),
+                                        )
+                                        .fill(self.settings.palette.tile.color()),
+                                    )
+                                    .clicked()
+                                {
+                                    self.reload_media_library();
+                                }
+                            });
+
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new(format!(
+                                    "Indexed {} local media files. Drop GIF/WebM files to store them locally, or add folders as referenced libraries.",
+                                    self.media_items.len()
+                                ))
+                                .size(12.0)
+                                .color(self.settings.palette.muted.color()),
+                            );
+
+                            if !self.settings.gif_import_paths.is_empty() {
+                                ui.add_space(8.0);
+                            }
+
+                            let import_paths = self.settings.gif_import_paths.clone();
+                            for path in import_paths {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(truncate_chars(
+                                            &path.display().to_string(),
+                                            72,
+                                        ))
+                                        .size(12.0)
+                                        .color(self.settings.palette.muted.color()),
+                                    );
+                                    if ui
+                                        .small_button(
+                                            RichText::new("Remove")
+                                                .color(self.settings.palette.danger.color()),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.remove_media_import_path(&path);
+                                    }
+                                });
+                            }
                         });
 
                         ui.add_space(12.0);
@@ -957,6 +1257,16 @@ impl SymbolisApp {
     }
 }
 
+fn draw_empty_state(ui: &mut egui::Ui, app: &SymbolisApp, message: &str) {
+    ui.centered_and_justified(|ui| {
+        ui.label(
+            RichText::new(message)
+                .size(16.0)
+                .color(app.settings.palette.muted.color()),
+        );
+    });
+}
+
 fn draw_symbol_grid(ui: &mut egui::Ui, app: &mut SymbolisApp, filtered: &[Entry]) {
     let chrome = chrome(app.settings.interface_mode);
     let modern = app.settings.interface_mode.is_modern();
@@ -996,6 +1306,227 @@ fn draw_symbol_grid(ui: &mut egui::Ui, app: &mut SymbolisApp, filtered: &[Entry]
                 ui.add_space(chrome.tile_gap);
             }
         });
+}
+
+fn draw_media_grid(ui: &mut egui::Ui, app: &mut SymbolisApp, filtered: &[MediaItem]) {
+    let chrome = chrome(app.settings.interface_mode);
+    let available_width = ui.available_width().max(1.0) - chrome.grid_side_padding * 2.0;
+    let preferred_width = if app.settings.interface_mode.is_modern() {
+        160.0
+    } else {
+        142.0
+    };
+    let columns = ((available_width + chrome.tile_gap) / (preferred_width + chrome.tile_gap))
+        .floor()
+        .max(1.0) as usize;
+    let tile_width = ((available_width - chrome.tile_gap * (columns.saturating_sub(1) as f32))
+        / columns as f32)
+        .floor()
+        .max(118.0);
+    let rows = filtered.len().div_ceil(columns);
+    let row_height = media_tile_height(app) + chrome.tile_gap;
+
+    ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show_rows(ui, row_height, rows, |ui, row_range| {
+            for row_index in row_range {
+                let start = row_index * columns;
+                let end = (start + columns).min(filtered.len());
+                ui.horizontal(|ui| {
+                    ui.add_space(chrome.grid_side_padding);
+                    ui.spacing_mut().item_spacing.x = chrome.tile_gap;
+
+                    for item in &filtered[start..end] {
+                        let response = draw_media_tile(ui, app, item, tile_width);
+                        if response.clicked() {
+                            let favorite_clicked =
+                                response.interact_pointer_pos().is_some_and(|pos| {
+                                    media_favorite_rect(response.rect).contains(pos)
+                                });
+                            if favorite_clicked {
+                                app.toggle_media_favorite(item);
+                            } else {
+                                app.copy_media_file(item);
+                            }
+                        }
+                        response.context_menu(|ui| {
+                            let favorite_label = if app.is_media_favorite(item) {
+                                "Remove favorite"
+                            } else {
+                                "Add favorite"
+                            };
+                            if ui.button(favorite_label).clicked() {
+                                app.toggle_media_favorite(item);
+                                ui.close_menu();
+                            }
+                            if ui
+                                .add_enabled(
+                                    item.format == MediaFormat::Gif,
+                                    Button::new("Save optimized WebM"),
+                                )
+                                .on_hover_text(
+                                    "Store an optimized WebM copy in the Symbolis media directory",
+                                )
+                                .clicked()
+                            {
+                                app.save_optimized_media_copy(item);
+                                ui.close_menu();
+                            }
+                            if ui.button("Copy file").clicked() {
+                                app.copy_media_file(item);
+                                ui.close_menu();
+                            }
+                            if ui.button("Copy path").clicked() {
+                                app.copy_media_path(item);
+                                ui.close_menu();
+                            }
+                            if ui
+                                .add_enabled(
+                                    app.drag_out.can_drag_files(),
+                                    Button::new("Start drag"),
+                                )
+                                .clicked()
+                            {
+                                app.drag_media_file(item);
+                                ui.close_menu();
+                            }
+                            if ui.button("Open location").clicked() {
+                                app.open_media_location(item);
+                                ui.close_menu();
+                            }
+                        });
+                    }
+                });
+                ui.add_space(chrome.tile_gap);
+            }
+        });
+}
+
+fn media_tile_height(app: &SymbolisApp) -> f32 {
+    if app.settings.interface_mode.is_modern() {
+        118.0
+    } else {
+        104.0
+    }
+}
+
+fn draw_media_tile(
+    ui: &mut egui::Ui,
+    app: &mut SymbolisApp,
+    item: &MediaItem,
+    width: f32,
+) -> egui::Response {
+    let height = media_tile_height(app);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), Sense::click());
+    let palette = app.settings.palette;
+    let chrome = chrome(app.settings.interface_mode);
+    let modern = app.settings.interface_mode.is_modern();
+    let hover_t = ui.ctx().animate_bool(response.id, response.hovered());
+    let draw_rect = rect.expand(hover_t * if modern { 2.0 } else { 3.0 });
+    let fill = blend_color(palette.tile.color(), palette.tile_hover.color(), hover_t);
+    let stroke = if response.hovered() {
+        Stroke::new(1.0, palette.accent.color())
+    } else if modern {
+        Stroke::new(
+            1.0,
+            blend_color(palette.panel.color(), palette.tile.color(), 0.35),
+        )
+    } else {
+        Stroke::new(1.0, palette.panel.color())
+    };
+
+    ui.painter().rect(
+        draw_rect,
+        Rounding::same(chrome.tile_rounding),
+        fill,
+        stroke,
+    );
+
+    let preview_rect = Rect::from_min_max(
+        egui::pos2(draw_rect.left() + 10.0, draw_rect.top() + 10.0),
+        egui::pos2(draw_rect.right() - 10.0, draw_rect.bottom() - 42.0),
+    );
+    ui.painter().rect(
+        preview_rect,
+        Rounding::same((chrome.tile_rounding - 2.0).max(3.0)),
+        blend_color(palette.panel_dark.color(), palette.tile.color(), 0.28),
+        Stroke::new(
+            1.0,
+            blend_color(palette.panel.color(), palette.tile.color(), 0.45),
+        ),
+    );
+    ui.painter().text(
+        preview_rect.center(),
+        Align2::CENTER_CENTER,
+        item.format.label().to_uppercase(),
+        FontId::proportional(if modern { 24.0 } else { 21.0 }),
+        palette.text.color(),
+    );
+
+    let favorite_rect = media_favorite_rect(rect);
+    ui.painter().circle_filled(
+        favorite_rect.center(),
+        favorite_rect.width() * 0.48,
+        fade_color(palette.bg.color(), 0.72),
+    );
+    ui.painter().text(
+        favorite_rect.center(),
+        Align2::CENTER_CENTER,
+        if app.is_media_favorite(item) {
+            "★"
+        } else {
+            "☆"
+        },
+        FontId::proportional(17.0),
+        if app.is_media_favorite(item) {
+            palette.accent.color()
+        } else {
+            palette.muted.color()
+        },
+    );
+
+    let badge = format!("{} · {}", item.kind.label(), item.display_size());
+    ui.painter().text(
+        egui::pos2(draw_rect.left() + 10.0, draw_rect.bottom() - 31.0),
+        Align2::LEFT_CENTER,
+        truncate_chars(
+            &item.title,
+            ((width - 20.0) / 7.0).floor().max(8.0) as usize,
+        ),
+        FontId::proportional(if modern { 12.5 } else { 12.0 }),
+        palette.text.color(),
+    );
+    ui.painter().text(
+        egui::pos2(draw_rect.left() + 10.0, draw_rect.bottom() - 13.0),
+        Align2::LEFT_CENTER,
+        truncate_chars(&badge, ((width - 20.0) / 6.5).floor().max(8.0) as usize),
+        FontId::proportional(11.0),
+        palette.muted.color(),
+    );
+
+    let transfer_hint = if item.format == MediaFormat::Webm {
+        "Click exports GIF for clipboard; right-click for drag."
+    } else {
+        "Click copies the file; right-click for drag."
+    };
+    response.on_hover_text(format!(
+        "{}\n{}\n{}",
+        item.title,
+        item.path.display(),
+        transfer_hint,
+    ))
+}
+
+fn media_favorite_rect(rect: Rect) -> Rect {
+    Rect::from_center_size(
+        egui::pos2(rect.right() - 22.0, rect.top() + 22.0),
+        egui::vec2(26.0, 26.0),
+    )
+}
+
+fn status_is_error(status: &str) -> bool {
+    let status = status.to_lowercase();
+    status.contains("error") || status.starts_with("unsupported") || status.starts_with("drop ")
 }
 
 fn draw_symbol_tile(
