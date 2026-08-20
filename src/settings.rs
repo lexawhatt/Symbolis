@@ -652,9 +652,9 @@ pub(crate) fn configure_style(ctx: &Context, settings: &UiSettings) {
     style.visuals.widgets.hovered.bg_fill = colors.tile_hover.color();
     style.visuals.widgets.active.bg_fill = colors.accent.color();
     style.visuals.selection.bg_fill = colors.accent.color();
-    style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, colors.text.color());
-    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, colors.text.color());
-    style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, colors.text.color());
+    style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, colors.text.color());
+    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, colors.text.color());
+    style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, colors.text.color());
     style.visuals.widgets.noninteractive.rounding = rounding;
     style.visuals.widgets.inactive.rounding = rounding;
     style.visuals.widgets.hovered.rounding = rounding;
@@ -708,6 +708,14 @@ pub(crate) fn configure_fonts(ctx: &Context, settings: &UiSettings) {
     if let Some(base_font) = first_existing_font(&[
         ("NotoSans", "/usr/share/fonts/noto/NotoSans-Regular.ttf"),
         ("DejaVuSans", "/usr/share/fonts/TTF/DejaVuSans.ttf"),
+        (
+            "DejaVuSansDebian",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ),
+        (
+            "LiberationSans",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        ),
     ]) {
         font_paths.push(base_font);
     }
@@ -743,6 +751,10 @@ pub(crate) fn configure_fonts(ctx: &Context, settings: &UiSettings) {
             font_paths.push((
                 "NotoSansCJK",
                 "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+            ));
+            font_paths.push((
+                "NotoSansCJKDebian",
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
             ));
         }
     }

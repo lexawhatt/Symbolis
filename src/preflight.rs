@@ -158,7 +158,7 @@ pub(crate) fn run_startup_preflight() -> Result<PreflightReport, PreflightError>
             warnings.push(StartupWarning::new(
                 "Color emoji",
                 "pango-view is missing; emoji will use the fallback text renderer.",
-                "Install pango tools, usually packaged as pango, pango-utils, or libpango1.0-bin depending on the distribution.",
+                "Install pango-view. On Arch-based systems use `sudo pacman -S pango`; on Debian/Ubuntu use `sudo apt install pango1.0-tools`.",
             ));
         }
 

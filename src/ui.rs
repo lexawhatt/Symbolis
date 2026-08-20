@@ -720,7 +720,7 @@ impl SymbolisApp {
             Rounding::same(chrome.sidebar_rounding + 2.0),
             Color32::TRANSPARENT,
             Stroke::new(
-                1.0,
+                1.0_f32,
                 fade_color(
                     blend_color(
                         self.settings.palette.accent.color(),
@@ -811,9 +811,9 @@ impl SymbolisApp {
         let stroke = if selected {
             Stroke::new(
                 if self.settings.interface_mode.is_modern() {
-                    1.5
+                    1.5_f32
                 } else {
-                    1.0
+                    1.0_f32
                 },
                 fade_color(
                     blend_color(palette.accent.color(), palette.text.color(), 0.22),
@@ -821,7 +821,7 @@ impl SymbolisApp {
                 ),
             )
         } else {
-            Stroke::new(1.0, Color32::TRANSPARENT)
+            Stroke::new(1.0_f32, Color32::TRANSPARENT)
         };
 
         ui.painter().rect(
@@ -912,7 +912,7 @@ impl SymbolisApp {
         let color = fade_color(self.settings.palette.text.color(), opacity);
         let center = rect.center();
         let radius = rect.width().min(rect.height()) * 0.27;
-        let stroke = Stroke::new(2.0, color);
+        let stroke = Stroke::new(2.0_f32, color);
         ui.painter().circle_stroke(center, radius, stroke);
         ui.painter()
             .line_segment([center, center + egui::vec2(0.0, -radius * 0.55)], stroke);
@@ -959,7 +959,7 @@ impl SymbolisApp {
                             egui::pos2(ui.max_rect().left(), y),
                             egui::pos2(ui.max_rect().right(), y),
                         ],
-                        Stroke::new(1.0, self.settings.palette.panel.color()),
+                        Stroke::new(1.0_f32, self.settings.palette.panel.color()),
                     );
                 }
                 ui.add_space(10.0);
@@ -1274,7 +1274,12 @@ impl SymbolisApp {
             0.92,
         );
 
-        painter.rect(rect, Rounding::same(12.0), fill, Stroke::new(2.0, accent));
+        painter.rect(
+            rect,
+            Rounding::same(12.0),
+            fill,
+            Stroke::new(2.0_f32, accent),
+        );
         painter.text(
             rect.center(),
             Align2::CENTER_CENTER,
@@ -2261,9 +2266,9 @@ fn draw_sticker_pack_row(
         blend_color(palette.panel.color(), palette.tile.color(), hover_t * 0.62)
     };
     let stroke = if selected {
-        Stroke::new(1.0, palette.accent.color())
+        Stroke::new(1.0_f32, palette.accent.color())
     } else {
-        Stroke::new(1.0, Color32::TRANSPARENT)
+        Stroke::new(1.0_f32, Color32::TRANSPARENT)
     };
 
     ui.painter()
@@ -2981,18 +2986,18 @@ fn draw_media_tile(
     );
     let stroke = if selected {
         Stroke::new(
-            if response.hovered() { 2.0 } else { 1.5 },
+            if response.hovered() { 2.0_f32 } else { 1.5_f32 },
             palette.accent.color(),
         )
     } else if response.hovered() {
-        Stroke::new(1.0, palette.accent.color())
+        Stroke::new(1.0_f32, palette.accent.color())
     } else if modern {
         Stroke::new(
-            1.0,
+            1.0_f32,
             blend_color(palette.panel.color(), palette.tile.color(), 0.35),
         )
     } else {
-        Stroke::new(1.0, palette.panel.color())
+        Stroke::new(1.0_f32, palette.panel.color())
     };
 
     ui.painter().rect(
@@ -3011,7 +3016,7 @@ fn draw_media_tile(
             fade_color(palette.bg.color(), 0.72)
         },
         Stroke::new(
-            1.0,
+            1.0_f32,
             if selected {
                 palette.accent.color()
             } else {
@@ -3038,7 +3043,7 @@ fn draw_media_tile(
         Rounding::same((chrome.tile_rounding - 2.0).max(3.0)),
         blend_color(palette.panel_dark.color(), palette.tile.color(), 0.28),
         Stroke::new(
-            1.0,
+            1.0_f32,
             if selected {
                 blend_color(palette.accent.color(), palette.tile.color(), 0.35)
             } else {
@@ -3207,7 +3212,7 @@ fn draw_media_hover_preview(ui: &egui::Ui, preview: MediaHoverPreview<'_>) {
             blend_color(palette.bg.color(), palette.panel.color(), 0.4),
             0.94 * hover_t,
         ),
-        Stroke::new(1.0, fade_color(palette.accent.color(), hover_t)),
+        Stroke::new(1.0_f32, fade_color(palette.accent.color(), hover_t)),
     );
     let image_rect = fit_centered_with_max_scale(rect.shrink(10.0), texture.size_vec2(), 8.0);
     painter.with_clip_rect(rect.shrink(4.0)).image(
@@ -3287,14 +3292,14 @@ fn draw_symbol_tile(
     let draw_rect = rect.expand(hover_t * if modern { 2.0 } else { 3.0 });
     let fill = blend_color(palette.tile.color(), palette.tile_hover.color(), hover_t);
     let stroke = if response.hovered() {
-        Stroke::new(1.0, palette.accent.color())
+        Stroke::new(1.0_f32, palette.accent.color())
     } else if modern {
         Stroke::new(
-            1.0,
+            1.0_f32,
             blend_color(palette.panel.color(), palette.tile.color(), 0.35),
         )
     } else {
-        Stroke::new(1.0, palette.panel.color())
+        Stroke::new(1.0_f32, palette.panel.color())
     };
 
     ui.painter().rect(
@@ -3538,7 +3543,7 @@ fn settings_panel(
     Frame::none()
         .fill(blend_color(palette.panel.color(), palette.bg.color(), 0.18))
         .stroke(Stroke::new(
-            1.0,
+            1.0_f32,
             blend_color(palette.tile.color(), palette.panel.color(), 0.35),
         ))
         .rounding(Rounding::same(8.0))
