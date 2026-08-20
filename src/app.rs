@@ -15,6 +15,7 @@ use crate::{
     emoji_cache::EmojiCache,
     global_hotkeys::GlobalHotkeyRuntime,
     ipc::{IpcCommand, IpcServer},
+    logging::{self, LogLevel},
     media_clipboard::MediaClipboard,
     media_drag::{DragOutBackend, DragPreview, LinuxDragOutBackend},
     media_library::{
@@ -33,8 +34,8 @@ use crate::{
     persistence::write_json_atomic,
     preflight::{PreflightReport, StartupWarning},
     settings::{
-        FeatureSettings, HotkeyAction, UiSettings, configure_fonts, configure_style, load_settings,
-        save_settings, settings_path,
+        FeatureSettings, FontLoadReport, HotkeyAction, UiSettings, configure_fonts,
+        configure_style, load_settings, save_settings, settings_path,
     },
     telegram_stickers::{
         TELEGRAM_BOT_TOKEN_ENV, clear_saved_telegram_bot_token, load_saved_telegram_bot_token,
@@ -278,6 +279,7 @@ pub(crate) struct SymbolisApp {
     pub(crate) drag_out: LinuxDragOutBackend,
     pub(crate) status: Option<String>,
     pub(crate) startup_warnings: Vec<StartupWarning>,
+    pub(crate) font_load_report: FontLoadReport,
     pub(crate) data_source: DataSource,
     pub(crate) settings: UiSettings,
     pub(crate) emoji_cache: EmojiCache,
@@ -316,8 +318,15 @@ impl SymbolisApp {
             .and_then(load_settings)
             .unwrap_or_default();
         settings.features.ensure_any_content_enabled();
-        configure_fonts(&cc.egui_ctx, &settings);
+        let font_load_report = configure_fonts(&cc.egui_ctx, &settings);
+        logging::log(LogLevel::Info, font_load_report.label());
         configure_style(&cc.egui_ctx, &settings);
+        for warning in &preflight.warnings {
+            logging::log(
+                LogLevel::Important,
+                format!("{}: {}", warning.feature, warning.message),
+            );
+        }
 
         let (entries, data_source) = load_entries(settings.features.symbols);
         let recent_path = recent_path();
@@ -392,6 +401,7 @@ impl SymbolisApp {
             drag_out: LinuxDragOutBackend::new(preflight.linux_session, preflight.drag_helper),
             status: None,
             startup_warnings: preflight.warnings,
+            font_load_report,
             data_source,
             settings,
             emoji_cache: EmojiCache::new(preflight.color_emoji_renderer),
@@ -1324,7 +1334,8 @@ impl SymbolisApp {
 
     pub(crate) fn apply_feature_settings(&mut self, ctx: &Context) {
         self.settings.features.ensure_any_content_enabled();
-        configure_fonts(ctx, &self.settings);
+        self.font_load_report = configure_fonts(ctx, &self.settings);
+        logging::log(LogLevel::Info, self.font_load_report.label());
         let (entries, data_source) = load_entries(self.settings.features.symbols);
         self.entries = entries;
         self.data_source = data_source;
@@ -1525,7 +1536,7 @@ impl SymbolisApp {
         self.dev_log.iter()
     }
 
-    pub(crate) fn clear_everything(&mut self) {
+    pub(crate) fn clear_everything(&mut self, ctx: &Context) {
         let mut errors = Vec::new();
 
         remove_symbolis_tree(symbolis_data_root(), "data", &mut errors);
@@ -1540,6 +1551,9 @@ impl SymbolisApp {
         self.recent_media.clear();
         self.favorite_media_ids.clear();
         self.settings = UiSettings::default();
+        self.font_load_report = configure_fonts(ctx, &self.settings);
+        configure_style(ctx, &self.settings);
+        logging::log(LogLevel::Info, self.font_load_report.label());
         self.update_media_watcher();
         self.app_view = AppView::Main;
         self.content_mode = ContentMode::Symbols;
@@ -1562,8 +1576,21 @@ impl SymbolisApp {
         self.media_scan_completion_status = None;
 
         self.status = if errors.is_empty() {
+            logging::log(
+                LogLevel::Info,
+                "cleared Symbolis data, config, cache, and local media",
+            );
             Some("Cleared Symbolis data, config, cache, and local media".to_owned())
         } else {
+            logging::log(
+                LogLevel::Important,
+                format!(
+                    "clear finished with {} error{}: {}",
+                    errors.len(),
+                    plural_suffix(errors.len()),
+                    errors.join("; ")
+                ),
+            );
             Some(format!(
                 "Clear finished with {} error{}: {}",
                 errors.len(),
@@ -1625,12 +1652,14 @@ impl SymbolisApp {
     }
 
     fn log_dev(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        logging::log(LogLevel::Trace, &message);
         if self.dev_log.len() >= DEV_LOG_LIMIT {
             self.dev_log.pop_front();
         }
         self.dev_log.push_back(DevLogEntry {
             elapsed_ms: self.app_started_at.elapsed().as_millis(),
-            message: message.into(),
+            message,
         });
     }
 

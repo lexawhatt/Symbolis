@@ -33,6 +33,35 @@ Run the built binary:
 
 On startup, Symbolis checks the desktop session and optional helper tools. Missing required desktop capabilities stop startup with an error window when possible and also print the error to stderr. Missing optional tools are shown as warnings in Preferences -> System.
 
+## Logging
+
+Symbolis logs to stderr. The default level is `0`.
+
+Set the level with either an environment variable:
+
+```bash
+SYMBOLIS_LOG_LEVEL=1 ./target/release/symbolis
+```
+
+or a command-line option:
+
+```bash
+./target/release/symbolis --log-level 2
+./target/release/symbolis --log-level=2
+```
+
+Levels:
+
+- `0`: important startup/runtime warnings and errors.
+- `1`: level 0 plus useful startup diagnostics, including loaded font information.
+- `2`: level 1 plus trace-level development events such as media scans, jobs, and internal dev log entries.
+
+For font/debug reports, use:
+
+```bash
+SYMBOLIS_LOG_LEVEL=1 ./target/release/symbolis
+```
+
 ## Runtime Requirements
 
 Required:

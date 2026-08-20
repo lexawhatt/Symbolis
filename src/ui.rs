@@ -1348,7 +1348,7 @@ impl SymbolisApp {
                             )
                             .clicked()
                         {
-                            self.clear_everything();
+                            self.clear_everything(ctx);
                         }
                         if ui
                             .add(
@@ -2231,7 +2231,11 @@ impl SymbolisApp {
             if features_changed {
                 self.apply_feature_settings(ctx);
             } else if performance_changed {
-                crate::settings::configure_fonts(ctx, &self.settings);
+                self.font_load_report = crate::settings::configure_fonts(ctx, &self.settings);
+                crate::logging::log(
+                    crate::logging::LogLevel::Info,
+                    self.font_load_report.label(),
+                );
             }
             if performance_changed {
                 self.emoji_cache = EmojiCache::new(self.emoji_cache.color_renderer_available());

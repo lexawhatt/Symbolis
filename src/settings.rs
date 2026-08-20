@@ -14,6 +14,30 @@ use crate::persistence::write_json_atomic;
 pub(crate) const MEDIA_PREVIEW_FRAMERATE_MIN_FPS: u32 = 1;
 pub(crate) const MEDIA_PREVIEW_FRAMERATE_MAX_FPS: u32 = 24;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FontLoadReport {
+    pub(crate) built_in_fonts: usize,
+    pub(crate) system_fonts: Vec<String>,
+    pub(crate) proportional_family_fonts: usize,
+    pub(crate) monospace_family_fonts: usize,
+}
+
+impl FontLoadReport {
+    pub(crate) fn label(&self) -> String {
+        format!(
+            "fonts: built-in={}, system=[{}], proportional={}, monospace={}",
+            self.built_in_fonts,
+            if self.system_fonts.is_empty() {
+                "none".to_owned()
+            } else {
+                self.system_fonts.join(", ")
+            },
+            self.proportional_family_fonts,
+            self.monospace_family_fonts
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) enum Preset {
     ModernDark,
@@ -308,6 +332,15 @@ pub(crate) struct Palette {
     pub(crate) danger: Rgb,
 }
 
+impl Palette {
+    fn sanitize_readability(&mut self, fallback: Palette) {
+        let surfaces = [self.bg, self.panel, self.tile];
+        self.text = readable_color(self.text, fallback.text, surfaces, 4.5);
+        self.muted = readable_color(self.muted, fallback.muted, surfaces, 3.0);
+        self.danger = readable_color(self.danger, fallback.danger, surfaces, 3.0);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub(crate) struct MediaHoverPreviewSettings {
     #[serde(default = "default_media_hover_preview_enabled")]
@@ -575,6 +608,14 @@ impl UiSettings {
         true
     }
 
+    fn sanitize_palette_readability(&mut self) {
+        let fallback = palette_for(self.fallback_preset());
+        self.palette.sanitize_readability(fallback);
+        for theme in &mut self.custom_themes {
+            theme.palette.sanitize_readability(fallback);
+        }
+    }
+
     pub(crate) fn selected_custom_theme_name(&self) -> Option<&str> {
         match &self.theme {
             ThemeSelection::Custom(name) => Some(name.as_str()),
@@ -628,6 +669,7 @@ pub(crate) fn load_settings(path: &Path) -> Option<UiSettings> {
     } else if !content.contains("\"theme\"") {
         settings.theme = ThemeSelection::Preset(settings.preset);
     }
+    settings.sanitize_palette_readability();
     settings.media_hover_preview.sanitize();
 
     Some(settings)
@@ -670,6 +712,64 @@ fn is_dark(color: Color32) -> bool {
     luminance < 128.0
 }
 
+fn color_luminance(color: Rgb) -> f32 {
+    0.2126 * f32::from(color.0[0]) + 0.7152 * f32::from(color.0[1]) + 0.0722 * f32::from(color.0[2])
+}
+
+fn contrast_ratio(a: Rgb, b: Rgb) -> f32 {
+    fn channel(value: u8) -> f32 {
+        let value = f32::from(value) / 255.0;
+        if value <= 0.03928 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn relative_luminance(color: Rgb) -> f32 {
+        0.2126 * channel(color.0[0]) + 0.7152 * channel(color.0[1]) + 0.0722 * channel(color.0[2])
+    }
+
+    let a = relative_luminance(a);
+    let b = relative_luminance(b);
+    let lighter = a.max(b);
+    let darker = a.min(b);
+    (lighter + 0.05) / (darker + 0.05)
+}
+
+fn readable_color(color: Rgb, fallback: Rgb, surfaces: [Rgb; 3], min_contrast: f32) -> Rgb {
+    if color_is_readable(color, surfaces, min_contrast) {
+        return color;
+    }
+    if color_is_readable(fallback, surfaces, min_contrast) {
+        return fallback;
+    }
+
+    let average_luminance = surfaces
+        .iter()
+        .map(|color| color_luminance(*color))
+        .sum::<f32>()
+        / surfaces.len() as f32;
+    let high_contrast = if average_luminance < 128.0 {
+        Rgb::new(245, 248, 252)
+    } else {
+        Rgb::new(18, 20, 24)
+    };
+    if color_is_readable(high_contrast, surfaces, min_contrast) {
+        high_contrast
+    } else if average_luminance < 128.0 {
+        Rgb::new(255, 255, 255)
+    } else {
+        Rgb::new(0, 0, 0)
+    }
+}
+
+fn color_is_readable(color: Rgb, surfaces: [Rgb; 3], min_contrast: f32) -> bool {
+    surfaces
+        .into_iter()
+        .all(|surface| contrast_ratio(color, surface) >= min_contrast)
+}
+
 fn sanitize_theme_name(value: &str) -> String {
     value.trim().chars().take(48).collect()
 }
@@ -701,8 +801,9 @@ pub(crate) fn hotkey_key_label(key: &str) -> &str {
     }
 }
 
-pub(crate) fn configure_fonts(ctx: &Context, settings: &UiSettings) {
+pub(crate) fn configure_fonts(ctx: &Context, settings: &UiSettings) -> FontLoadReport {
     let mut fonts = FontDefinitions::default();
+    let built_in_fonts = fonts.font_data.len();
 
     let mut font_paths = Vec::new();
     if let Some(base_font) = first_existing_font(&[
@@ -759,11 +860,13 @@ pub(crate) fn configure_fonts(ctx: &Context, settings: &UiSettings) {
         }
     }
 
+    let mut system_fonts = Vec::new();
     for (name, path) in font_paths {
         let Ok(bytes) = fs::read(path) else {
             continue;
         };
 
+        system_fonts.push(name.to_owned());
         fonts
             .font_data
             .insert(name.to_owned(), FontData::from_owned(bytes));
@@ -776,7 +879,22 @@ pub(crate) fn configure_fonts(ctx: &Context, settings: &UiSettings) {
         }
     }
 
+    let proportional_family_fonts = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .map_or(0, Vec::len);
+    let monospace_family_fonts = fonts
+        .families
+        .get(&FontFamily::Monospace)
+        .map_or(0, Vec::len);
+    let report = FontLoadReport {
+        built_in_fonts,
+        system_fonts,
+        proportional_family_fonts,
+        monospace_family_fonts,
+    };
     ctx.set_fonts(fonts);
+    report
 }
 
 fn first_existing_font(
@@ -990,6 +1108,32 @@ mod tests {
         let settings: UiSettings = serde_json::from_value(value).unwrap();
 
         assert_eq!(settings.media_hover_preview.framerate_fps, 6);
+    }
+
+    #[test]
+    fn unreadable_legacy_palette_gets_readable_text_colors() {
+        let mut settings = UiSettings::from_preset(Preset::ModernDark);
+        settings.palette.text = settings.palette.bg;
+        settings.palette.muted = settings.palette.panel;
+        settings.palette.danger = settings.palette.tile;
+
+        let path = std::env::temp_dir().join(format!(
+            "symbolis-unreadable-theme-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, serde_json::to_string(&settings).unwrap()).unwrap();
+
+        let loaded = load_settings(&path).unwrap();
+        let _ = fs::remove_file(path);
+
+        assert!(contrast_ratio(loaded.palette.text, loaded.palette.bg) >= 4.5);
+        assert!(contrast_ratio(loaded.palette.text, loaded.palette.panel) >= 4.5);
+        assert!(contrast_ratio(loaded.palette.text, loaded.palette.tile) >= 4.5);
+        assert!(contrast_ratio(loaded.palette.muted, loaded.palette.bg) >= 3.0);
     }
 
     #[test]

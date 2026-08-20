@@ -5,6 +5,7 @@ mod emoji_cache;
 mod gif_provider;
 mod global_hotkeys;
 mod ipc;
+mod logging;
 mod media_clipboard;
 mod media_drag;
 mod media_library;
