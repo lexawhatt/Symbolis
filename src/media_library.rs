@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
@@ -9,7 +9,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub(crate) enum MediaKind {
     Gif,
     Sticker,
@@ -338,7 +338,7 @@ fn export_video_to_gif(item: &MediaItem) -> Result<PathBuf, MediaTranscodeError>
     Ok(output)
 }
 
-pub(crate) fn scan_media_library(paths: &[PathBuf]) -> Vec<MediaItem> {
+pub(crate) fn scan_media_library(paths: &[PathBuf], deduplicate: bool) -> Vec<MediaItem> {
     let mut items = Vec::new();
     let mut seen_dirs = HashSet::new();
     let mut seen_files = HashSet::new();
@@ -347,12 +347,55 @@ pub(crate) fn scan_media_library(paths: &[PathBuf]) -> Vec<MediaItem> {
         scan_path(path, &mut seen_dirs, &mut seen_files, &mut items);
     }
 
+    if deduplicate {
+        items = deduplicate_media_items(items);
+    }
+
     items.sort_by(|a, b| {
         b.modified_at
             .cmp(&a.modified_at)
             .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
     });
     items
+}
+
+fn deduplicate_media_items(items: Vec<MediaItem>) -> Vec<MediaItem> {
+    let mut by_content = HashMap::<(MediaKind, u64, String), MediaItem>::new();
+
+    for item in items {
+        let Ok(hash) = file_content_hash(&item.path) else {
+            by_content.insert(
+                (item.kind, item.size_bytes, format!("path:{}", item.id)),
+                item,
+            );
+            continue;
+        };
+
+        let key = (item.kind, item.size_bytes, hash);
+        match by_content.get(&key) {
+            Some(existing) if prefer_media_item(existing, &item) => {}
+            _ => {
+                by_content.insert(key, item);
+            }
+        }
+    }
+
+    by_content.into_values().collect()
+}
+
+fn prefer_media_item(existing: &MediaItem, candidate: &MediaItem) -> bool {
+    let existing_local = path_is_under_media_root(&existing.path);
+    let candidate_local = path_is_under_media_root(&candidate.path);
+
+    if existing_local != candidate_local {
+        return existing_local;
+    }
+
+    existing.modified_at >= candidate.modified_at
+}
+
+fn path_is_under_media_root(path: &Path) -> bool {
+    media_root().is_some_and(|root| path.starts_with(root))
 }
 
 pub(crate) fn is_supported_media_path(path: &Path) -> bool {
@@ -740,7 +783,7 @@ mod tests {
         fs::write(root.join("notes.txt"), b"text").unwrap();
         fs::write(nested.join("sticker.png"), b"png").unwrap();
 
-        let items = scan_media_library(std::slice::from_ref(&root));
+        let items = scan_media_library(std::slice::from_ref(&root), true);
 
         fs::remove_dir_all(&root).unwrap();
 
@@ -796,6 +839,20 @@ mod tests {
         assert_eq!(loaded[0].title, "reaction");
     }
 
+    #[test]
+    fn scanner_deduplicates_identical_media_content() {
+        let root = unique_test_dir();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("first.gif"), b"same-gif").unwrap();
+        fs::write(root.join("second.gif"), b"same-gif").unwrap();
+
+        let items = scan_media_library(std::slice::from_ref(&root), true);
+
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(items.len(), 1);
+    }
+
     #[cfg(unix)]
     #[test]
     fn scanner_skips_symlink_directory_cycles() {
@@ -805,7 +862,7 @@ mod tests {
         fs::write(nested.join("reaction.gif"), b"gif").unwrap();
         std::os::unix::fs::symlink(&root, nested.join("back-to-root")).unwrap();
 
-        let items = scan_media_library(std::slice::from_ref(&root));
+        let items = scan_media_library(std::slice::from_ref(&root), true);
 
         fs::remove_dir_all(&root).unwrap();
 

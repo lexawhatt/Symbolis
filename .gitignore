@@ -1,5 +1,15 @@
-/target
+# Rust build output
+/target/
+
+# Local editor and Codex state
+/.agents/
+/.codex/
+/.idea/
+
+# Local planning notes and imported AI summaries
 /brainstorm.md
-/.agents
-/.codex
-/.idea
+/*_conversation_summary.md
+
+# OS/editor noise
+.DS_Store
+*.swp

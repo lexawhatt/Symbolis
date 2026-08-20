@@ -16,7 +16,10 @@ use crate::{
     gif_provider::{GifProvider, ProviderStatus},
     media_drag::DragOutBackend,
     media_library::{MediaFormat, MediaItem, MediaKind},
-    settings::{InterfaceMode, Palette, Preset, Rgb, ThemeSelection},
+    settings::{
+        HotkeyAction, HotkeyBinding, InterfaceMode, Palette, Preset, Rgb, ThemeSelection,
+        hotkey_key_label,
+    },
 };
 
 const SIDEBAR_WIDTH: f32 = 56.0;
@@ -903,6 +906,52 @@ impl SymbolisApp {
     }
 
     fn draw_topbar_clear_actions(&mut self, ui: &mut egui::Ui, modern: bool) {
+        if self.app_view == AppView::Main && self.content_mode.media_kind().is_some() {
+            if self.selected_media_count() > 0 {
+                if ui
+                    .button(RichText::new("Clear").color(self.settings.palette.text.color()))
+                    .on_hover_text("Clear media selection")
+                    .clicked()
+                {
+                    self.clear_media_selection();
+                }
+                ui.add_space(if modern { 8.0 } else { 6.0 });
+                if ui
+                    .button(RichText::new("Delete").color(self.settings.palette.danger.color()))
+                    .on_hover_text("Delete selected library media files")
+                    .clicked()
+                {
+                    self.delete_selected_media_files();
+                }
+                ui.add_space(if modern { 8.0 } else { 6.0 });
+                if ui
+                    .button(RichText::new("Unfavorite").color(self.settings.palette.text.color()))
+                    .on_hover_text("Remove selected media from favorites")
+                    .clicked()
+                {
+                    self.remove_selected_media_from_favorites();
+                }
+                ui.add_space(if modern { 8.0 } else { 6.0 });
+                if ui
+                    .button(RichText::new("Favorite").color(self.settings.palette.text.color()))
+                    .on_hover_text("Add selected media to favorites")
+                    .clicked()
+                {
+                    self.add_selected_media_to_favorites();
+                }
+                ui.add_space(if modern { 12.0 } else { 10.0 });
+            } else {
+                if ui
+                    .button(RichText::new("Select all").color(self.settings.palette.text.color()))
+                    .on_hover_text("Select all media visible in the current view")
+                    .clicked()
+                {
+                    self.select_filtered_media();
+                }
+                ui.add_space(if modern { 12.0 } else { 10.0 });
+            }
+        }
+
         if self.app_view == AppView::Main
             && self.content_mode == ContentMode::Symbols
             && self.selected_tab == Tab::Recent
@@ -1021,6 +1070,9 @@ impl SymbolisApp {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             for mode in ContentMode::CHOICES {
+                if !self.content_mode_enabled(mode) {
+                    continue;
+                }
                 let selected = self.content_mode == mode;
                 let button = Button::new(
                     RichText::new(mode.label())
@@ -1221,6 +1273,7 @@ impl SymbolisApp {
                             let source = match &self.data_source {
                                 DataSource::Rofimoji(path) => path.display().to_string(),
                                 DataSource::BuiltIn => "built-in fallback".to_owned(),
+                                DataSource::Disabled => "symbols disabled".to_owned(),
                             };
                             ui.label(
                                 RichText::new(source)
@@ -1291,6 +1344,8 @@ impl SymbolisApp {
         let mut changed = false;
         let mut manual_changed = false;
         let mut theme_changed = false;
+        let mut features_changed = false;
+        let mut hotkeys_changed = false;
 
         ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -1421,6 +1476,113 @@ impl SymbolisApp {
                                 changed = true;
                                 manual_changed = true;
                             }
+                        });
+
+                        ui.add_space(12.0);
+                        settings_panel(ui, "Features", self.settings.palette, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                features_changed |= ui
+                                    .checkbox(&mut self.settings.features.symbols, "Symbols")
+                                    .on_hover_text(
+                                        "Load emoji, kaomoji, symbols, and wide glyph fonts",
+                                    )
+                                    .changed();
+                                features_changed |= ui
+                                    .checkbox(&mut self.settings.features.stickers, "Stickers")
+                                    .on_hover_text("Index and show local sticker media")
+                                    .changed();
+                                features_changed |= ui
+                                    .checkbox(&mut self.settings.features.gifs, "GIFs")
+                                    .on_hover_text("Index and show GIF/video media")
+                                    .changed();
+                            });
+                        });
+
+                        ui.add_space(12.0);
+                        settings_panel(ui, "Global Hotkeys", self.settings.palette, |ui| {
+                            hotkeys_changed |= ui
+                                .checkbox(
+                                    &mut self.settings.hotkeys.enabled,
+                                    "Enable built-in hotkey backend",
+                                )
+                                .on_hover_text("Optional X11-oriented backend; system launcher shortcut below is preferred on Wayland")
+                                .changed();
+                            ui.add_space(8.0);
+                            hotkeys_changed |= draw_hotkey_row(self, ui, ctx, HotkeyAction::Main);
+
+                            ui.label(
+                                RichText::new(self.global_hotkey_status())
+                                    .size(12.0)
+                                    .color(self.settings.palette.muted.color()),
+                            );
+
+                            ui.add_space(10.0);
+                            ui.separator();
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new("System launcher command")
+                                    .size(12.0)
+                                    .strong()
+                                    .color(self.settings.palette.text.color()),
+                            );
+                            ui.label(
+                                RichText::new(self.toggle_command_label())
+                                    .size(12.0)
+                                    .monospace()
+                                    .color(self.settings.palette.muted.color()),
+                            );
+                            ui.horizontal_wrapped(|ui| {
+                                if ui
+                                    .add(
+                                        Button::new(
+                                            RichText::new("Copy command")
+                                                .color(self.settings.palette.text.color()),
+                                        )
+                                        .fill(self.settings.palette.tile.color()),
+                                    )
+                                    .on_hover_text("Use this command in your desktop shortcut settings")
+                                    .clicked()
+                                {
+                                    self.copy_toggle_command();
+                                }
+
+                                if ui
+                                    .add(
+                                        Button::new(
+                                            RichText::new("Install launcher")
+                                                .color(self.settings.palette.text.color()),
+                                        )
+                                        .fill(self.settings.palette.tile.color()),
+                                    )
+                                    .on_hover_text("Creates ~/.local/share/applications/symbolis-toggle.desktop")
+                                    .clicked()
+                                {
+                                    self.install_toggle_desktop_launcher();
+                                }
+
+                                if ui
+                                    .add(
+                                        Button::new(
+                                            RichText::new("Apply KDE shortcut")
+                                                .color(self.settings.palette.text.color()),
+                                        )
+                                        .fill(self.settings.palette.tile.color()),
+                                    )
+                                    .on_hover_text(
+                                        "Writes Plasma's kglobalshortcutsrc using the selected global hotkey",
+                                    )
+                                    .clicked()
+                                {
+                                    self.apply_kde_toggle_shortcut();
+                                }
+                            });
+                            ui.label(
+                                RichText::new(
+                                    "Bind this command or launcher in your desktop's keyboard shortcuts. It starts Symbolis if needed, shows it if hidden/minimized, and hides it when pressed again while focused.",
+                                )
+                                .size(12.0)
+                                .color(self.settings.palette.muted.color()),
+                            );
                         });
 
                         ui.add_space(12.0);
@@ -1662,6 +1824,36 @@ impl SymbolisApp {
                                     );
                                 }
                             }
+
+                            ui.add_space(10.0);
+                            ui.horizontal_wrapped(|ui| {
+                                if ui
+                                    .add(
+                                        Button::new(
+                                            RichText::new("Hide window")
+                                                .color(self.settings.palette.text.color()),
+                                        )
+                                        .fill(self.settings.palette.tile.color()),
+                                    )
+                                    .on_hover_text("Keep Symbolis running in the background")
+                                    .clicked()
+                                {
+                                    self.hide_window(ctx);
+                                }
+                                if ui
+                                    .add(
+                                        Button::new(
+                                            RichText::new("Quit Symbolis")
+                                                .color(self.settings.palette.danger.color()),
+                                        )
+                                        .fill(self.settings.palette.tile.color()),
+                                    )
+                                    .on_hover_text("Exit the background process")
+                                    .clicked()
+                                {
+                                    self.quit_app(ctx);
+                                }
+                            });
                         });
 
                         ui.add_space(12.0);
@@ -1750,10 +1942,18 @@ impl SymbolisApp {
 
         changed |= manual_changed;
         changed |= theme_changed;
+        changed |= features_changed;
+        changed |= hotkeys_changed;
 
         if changed {
             if theme_changed {
                 self.settings.ensure_editable_theme();
+            }
+            if features_changed {
+                self.apply_feature_settings(ctx);
+            }
+            if hotkeys_changed {
+                self.rebuild_global_hotkeys();
             }
             crate::settings::configure_style(ctx, &self.settings);
             self.save_settings();
@@ -1811,6 +2011,240 @@ fn draw_sticker_pack_row(
     );
 
     response.on_hover_text(format!("{label} ({count})"))
+}
+
+fn draw_hotkey_row(
+    app: &mut SymbolisApp,
+    ui: &mut egui::Ui,
+    ctx: &Context,
+    action: HotkeyAction,
+) -> bool {
+    let mut changed = false;
+    let palette = app.settings.palette;
+    let capturing = app.capture_hotkey_action == Some(action);
+
+    if capturing && let Some((key, shift, control, alt)) = capture_hotkey_key(ctx) {
+        let binding = app
+            .settings
+            .hotkeys
+            .binding_mut(action)
+            .get_or_insert_with(|| HotkeyBinding::new(""));
+        binding.key = key;
+        binding.shift = shift;
+        binding.control = control;
+        binding.alt = alt;
+        app.capture_hotkey_action = None;
+        changed = true;
+    }
+
+    egui::Grid::new("global_hotkey_binding_grid")
+        .num_columns(3)
+        .spacing([16.0, 8.0])
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(action.label())
+                    .size(12.0)
+                    .color(palette.text.color()),
+            );
+
+            ui.horizontal(|ui| {
+                let binding = app
+                    .settings
+                    .hotkeys
+                    .binding_mut(action)
+                    .get_or_insert_with(|| HotkeyBinding::new(""));
+                changed |= ui.checkbox(&mut binding.shift, "Shift").changed();
+                changed |= ui.checkbox(&mut binding.control, "Ctrl").changed();
+                changed |= ui.checkbox(&mut binding.alt, "Alt").changed();
+                changed |= ui.checkbox(&mut binding.super_key, "Super").changed();
+
+                let key_label = if binding.key.trim().is_empty() {
+                    "None".to_owned()
+                } else {
+                    hotkey_key_label(&binding.key).to_owned()
+                };
+                ui.label(
+                    RichText::new(format!("Key: {key_label}"))
+                        .size(12.0)
+                        .color(palette.muted.color()),
+                );
+            });
+
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        Button::new(
+                            RichText::new(if capturing {
+                                "Press key..."
+                            } else {
+                                "Set Global Hotkey"
+                            })
+                            .color(palette.text.color()),
+                        )
+                        .fill(if capturing {
+                            palette.accent.color()
+                        } else {
+                            palette.tile.color()
+                        }),
+                    )
+                    .on_hover_text("Press the main key after clicking; modifiers are selected here")
+                    .clicked()
+                {
+                    app.capture_hotkey_action = Some(action);
+                }
+
+                if ui
+                    .small_button(RichText::new("Clear").color(palette.danger.color()))
+                    .clicked()
+                {
+                    *app.settings.hotkeys.binding_mut(action) = None;
+                    if app.capture_hotkey_action == Some(action) {
+                        app.capture_hotkey_action = None;
+                    }
+                    changed = true;
+                }
+            });
+            ui.end_row();
+
+            ui.label("");
+            let label = app
+                .settings
+                .hotkeys
+                .binding(action)
+                .filter(|binding| !binding.key.trim().is_empty())
+                .map(HotkeyBinding::label)
+                .unwrap_or_else(|| "None".to_owned());
+            ui.label(
+                RichText::new(format!("Global hotkey: {label}"))
+                    .size(12.0)
+                    .color(palette.muted.color()),
+            );
+            ui.label("");
+            ui.end_row();
+        });
+
+    changed
+}
+
+fn capture_hotkey_key(ctx: &Context) -> Option<(String, bool, bool, bool)> {
+    ctx.input(|input| {
+        for key in egui::Key::ALL {
+            if input.key_pressed(*key)
+                && let Some(code) = hotkey_code_for_egui_key(*key)
+            {
+                return Some((
+                    code.to_owned(),
+                    input.modifiers.shift,
+                    input.modifiers.ctrl,
+                    input.modifiers.alt,
+                ));
+            }
+        }
+        None
+    })
+}
+
+fn hotkey_code_for_egui_key(key: egui::Key) -> Option<&'static str> {
+    use egui::Key;
+    match key {
+        Key::ArrowDown => Some("ArrowDown"),
+        Key::ArrowLeft => Some("ArrowLeft"),
+        Key::ArrowRight => Some("ArrowRight"),
+        Key::ArrowUp => Some("ArrowUp"),
+        Key::Tab => Some("Tab"),
+        Key::Backspace => Some("Backspace"),
+        Key::Enter => Some("Enter"),
+        Key::Space => Some("Space"),
+        Key::Insert => Some("Insert"),
+        Key::Delete => Some("Delete"),
+        Key::Home => Some("Home"),
+        Key::End => Some("End"),
+        Key::PageUp => Some("PageUp"),
+        Key::PageDown => Some("PageDown"),
+        Key::Comma => Some("Comma"),
+        Key::Backslash | Key::Pipe => Some("Backslash"),
+        Key::Slash | Key::Questionmark => Some("Slash"),
+        Key::OpenBracket => Some("BracketLeft"),
+        Key::CloseBracket => Some("BracketRight"),
+        Key::Backtick => Some("Backquote"),
+        Key::Minus => Some("Minus"),
+        Key::Period => Some("Period"),
+        Key::Plus | Key::Equals => Some("Equal"),
+        Key::Semicolon | Key::Colon => Some("Semicolon"),
+        Key::Quote => Some("Quote"),
+        Key::Num0 => Some("Digit0"),
+        Key::Num1 => Some("Digit1"),
+        Key::Num2 => Some("Digit2"),
+        Key::Num3 => Some("Digit3"),
+        Key::Num4 => Some("Digit4"),
+        Key::Num5 => Some("Digit5"),
+        Key::Num6 => Some("Digit6"),
+        Key::Num7 => Some("Digit7"),
+        Key::Num8 => Some("Digit8"),
+        Key::Num9 => Some("Digit9"),
+        Key::A => Some("KeyA"),
+        Key::B => Some("KeyB"),
+        Key::C => Some("KeyC"),
+        Key::D => Some("KeyD"),
+        Key::E => Some("KeyE"),
+        Key::F => Some("KeyF"),
+        Key::G => Some("KeyG"),
+        Key::H => Some("KeyH"),
+        Key::I => Some("KeyI"),
+        Key::J => Some("KeyJ"),
+        Key::K => Some("KeyK"),
+        Key::L => Some("KeyL"),
+        Key::M => Some("KeyM"),
+        Key::N => Some("KeyN"),
+        Key::O => Some("KeyO"),
+        Key::P => Some("KeyP"),
+        Key::Q => Some("KeyQ"),
+        Key::R => Some("KeyR"),
+        Key::S => Some("KeyS"),
+        Key::T => Some("KeyT"),
+        Key::U => Some("KeyU"),
+        Key::V => Some("KeyV"),
+        Key::W => Some("KeyW"),
+        Key::X => Some("KeyX"),
+        Key::Y => Some("KeyY"),
+        Key::Z => Some("KeyZ"),
+        Key::F1 => Some("F1"),
+        Key::F2 => Some("F2"),
+        Key::F3 => Some("F3"),
+        Key::F4 => Some("F4"),
+        Key::F5 => Some("F5"),
+        Key::F6 => Some("F6"),
+        Key::F7 => Some("F7"),
+        Key::F8 => Some("F8"),
+        Key::F9 => Some("F9"),
+        Key::F10 => Some("F10"),
+        Key::F11 => Some("F11"),
+        Key::F12 => Some("F12"),
+        Key::F13 => Some("F13"),
+        Key::F14 => Some("F14"),
+        Key::F15 => Some("F15"),
+        Key::F16 => Some("F16"),
+        Key::F17 => Some("F17"),
+        Key::F18 => Some("F18"),
+        Key::F19 => Some("F19"),
+        Key::F20 => Some("F20"),
+        Key::F21 => Some("F21"),
+        Key::F22 => Some("F22"),
+        Key::F23 => Some("F23"),
+        Key::F24 => Some("F24"),
+        Key::F25 => Some("F25"),
+        Key::F26 => Some("F26"),
+        Key::F27 => Some("F27"),
+        Key::F28 => Some("F28"),
+        Key::F29 => Some("F29"),
+        Key::F30 => Some("F30"),
+        Key::F31 => Some("F31"),
+        Key::F32 => Some("F32"),
+        Key::F33 => Some("F33"),
+        Key::F34 => Some("F34"),
+        Key::F35 => Some("F35"),
+        Key::Escape | Key::Copy | Key::Cut | Key::Paste => None,
+    }
 }
 
 fn draw_dev_metrics(ui: &mut egui::Ui, palette: Palette, snapshot: &DevMetricsSnapshot) {
@@ -2122,11 +2556,15 @@ fn draw_media_grid(ui: &mut egui::Ui, app: &mut SymbolisApp, filtered: &[MediaIt
                         };
                         let response = draw_media_tile(ui, app, &item, tile_width);
                         if response.clicked() {
-                            let favorite_clicked =
-                                response.interact_pointer_pos().is_some_and(|pos| {
-                                    media_favorite_rect(response.rect).contains(pos)
-                                });
-                            if favorite_clicked {
+                            let pointer_pos = response.interact_pointer_pos();
+                            let select_clicked = pointer_pos
+                                .is_some_and(|pos| media_select_rect(response.rect).contains(pos));
+                            let favorite_clicked = pointer_pos.is_some_and(|pos| {
+                                media_favorite_rect(response.rect).contains(pos)
+                            });
+                            if select_clicked {
+                                app.toggle_media_selected(&item);
+                            } else if favorite_clicked {
                                 app.toggle_media_favorite(&item);
                             } else {
                                 app.copy_media_file(&item);
@@ -2247,6 +2685,23 @@ fn draw_media_tile(
         stroke,
     );
 
+    let select_rect = media_select_rect(rect);
+    ui.painter().rect(
+        select_rect,
+        Rounding::same(4.0),
+        fade_color(palette.bg.color(), 0.72),
+        Stroke::new(1.0, palette.muted.color()),
+    );
+    if app.is_media_selected(item) {
+        ui.painter().text(
+            select_rect.center(),
+            Align2::CENTER_CENTER,
+            "✓",
+            FontId::proportional(15.0),
+            palette.accent.color(),
+        );
+    }
+
     let preview_rect = Rect::from_min_max(
         egui::pos2(draw_rect.left() + 10.0, draw_rect.top() + 10.0),
         egui::pos2(draw_rect.right() - 10.0, draw_rect.bottom() - 42.0),
@@ -2335,6 +2790,13 @@ fn media_favorite_rect(rect: Rect) -> Rect {
     Rect::from_center_size(
         egui::pos2(rect.right() - 22.0, rect.top() + 22.0),
         egui::vec2(26.0, 26.0),
+    )
+}
+
+fn media_select_rect(rect: Rect) -> Rect {
+    Rect::from_center_size(
+        egui::pos2(rect.left() + 22.0, rect.top() + 22.0),
+        egui::vec2(24.0, 24.0),
     )
 }
 

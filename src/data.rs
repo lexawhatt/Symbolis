@@ -238,9 +238,14 @@ impl From<StoredEntry> for Entry {
 pub(crate) enum DataSource {
     Rofimoji(PathBuf),
     BuiltIn,
+    Disabled,
 }
 
-pub(crate) fn load_entries() -> (Vec<Entry>, DataSource) {
+pub(crate) fn load_entries(symbols_enabled: bool) -> (Vec<Entry>, DataSource) {
+    if !symbols_enabled {
+        return (Vec::new(), DataSource::Disabled);
+    }
+
     for data_dir in candidate_data_dirs() {
         if let Ok(mut entries) = load_entries_from_dir(&data_dir)
             && !entries.is_empty()

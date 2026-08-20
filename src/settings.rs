@@ -70,6 +70,168 @@ pub(crate) struct CustomTheme {
     pub(crate) palette: Palette,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct FeatureSettings {
+    pub(crate) symbols: bool,
+    pub(crate) stickers: bool,
+    pub(crate) gifs: bool,
+    pub(crate) media_watcher: bool,
+    pub(crate) deduplicate_media: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub(crate) enum HotkeyAction {
+    Main,
+    Symbols,
+    Stickers,
+    Gifs,
+}
+
+impl HotkeyAction {
+    pub(crate) const CHOICES: [HotkeyAction; 1] = [HotkeyAction::Main];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            HotkeyAction::Main => "Toggle window",
+            HotkeyAction::Symbols => "Symbols",
+            HotkeyAction::Stickers => "Stickers",
+            HotkeyAction::Gifs => "GIFs",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct HotkeyBinding {
+    #[serde(default)]
+    pub(crate) shift: bool,
+    #[serde(default)]
+    pub(crate) control: bool,
+    #[serde(default)]
+    pub(crate) alt: bool,
+    #[serde(default)]
+    pub(crate) super_key: bool,
+    pub(crate) key: String,
+}
+
+impl HotkeyBinding {
+    pub(crate) fn new(key: impl Into<String>) -> Self {
+        Self {
+            shift: false,
+            control: false,
+            alt: false,
+            super_key: false,
+            key: key.into(),
+        }
+    }
+
+    pub(crate) fn canonical(&self) -> String {
+        let mut parts = Vec::new();
+        if self.shift {
+            parts.push("shift");
+        }
+        if self.control {
+            parts.push("control");
+        }
+        if self.alt {
+            parts.push("alt");
+        }
+        if self.super_key {
+            parts.push("super");
+        }
+        parts.push(self.key.as_str());
+        parts.join("+")
+    }
+
+    pub(crate) fn label(&self) -> String {
+        let mut parts = Vec::new();
+        if self.shift {
+            parts.push("Shift".to_owned());
+        }
+        if self.control {
+            parts.push("Ctrl".to_owned());
+        }
+        if self.alt {
+            parts.push("Alt".to_owned());
+        }
+        if self.super_key {
+            parts.push("Super".to_owned());
+        }
+        parts.push(hotkey_key_label(&self.key).to_owned());
+        parts.join("+")
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct HotkeySettings {
+    pub(crate) enabled: bool,
+    #[serde(default)]
+    pub(crate) main: Option<HotkeyBinding>,
+    #[serde(default)]
+    pub(crate) symbols: Option<HotkeyBinding>,
+    #[serde(default)]
+    pub(crate) stickers: Option<HotkeyBinding>,
+    #[serde(default)]
+    pub(crate) gifs: Option<HotkeyBinding>,
+}
+
+impl Default for HotkeySettings {
+    fn default() -> Self {
+        let mut main = HotkeyBinding::new("Period");
+        main.super_key = true;
+        Self {
+            enabled: false,
+            main: Some(main),
+            symbols: None,
+            stickers: None,
+            gifs: None,
+        }
+    }
+}
+
+impl HotkeySettings {
+    pub(crate) fn binding(&self, action: HotkeyAction) -> Option<&HotkeyBinding> {
+        match action {
+            HotkeyAction::Main => self.main.as_ref(),
+            HotkeyAction::Symbols => self.symbols.as_ref(),
+            HotkeyAction::Stickers => self.stickers.as_ref(),
+            HotkeyAction::Gifs => self.gifs.as_ref(),
+        }
+    }
+
+    pub(crate) fn binding_mut(&mut self, action: HotkeyAction) -> &mut Option<HotkeyBinding> {
+        match action {
+            HotkeyAction::Main => &mut self.main,
+            HotkeyAction::Symbols => &mut self.symbols,
+            HotkeyAction::Stickers => &mut self.stickers,
+            HotkeyAction::Gifs => &mut self.gifs,
+        }
+    }
+}
+
+impl Default for FeatureSettings {
+    fn default() -> Self {
+        Self {
+            symbols: true,
+            stickers: true,
+            gifs: true,
+            media_watcher: true,
+            deduplicate_media: true,
+        }
+    }
+}
+
+impl FeatureSettings {
+    pub(crate) fn enabled_content_count(&self) -> usize {
+        usize::from(self.symbols) + usize::from(self.stickers) + usize::from(self.gifs)
+    }
+
+    pub(crate) fn ensure_any_content_enabled(&mut self) {
+        if self.enabled_content_count() == 0 {
+            self.gifs = true;
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) enum InterfaceMode {
     #[default]
@@ -134,6 +296,10 @@ pub(crate) struct UiSettings {
     #[serde(default)]
     pub(crate) interface_mode: InterfaceMode,
     #[serde(default)]
+    pub(crate) features: FeatureSettings,
+    #[serde(default)]
+    pub(crate) hotkeys: HotkeySettings,
+    #[serde(default)]
     pub(crate) gif_provider: GifProvider,
     #[serde(default)]
     pub(crate) gif_import_paths: Vec<PathBuf>,
@@ -160,6 +326,8 @@ impl UiSettings {
     pub(crate) fn from_preset(preset: Preset) -> Self {
         Self {
             interface_mode: InterfaceMode::Modern,
+            features: FeatureSettings::default(),
+            hotkeys: HotkeySettings::default(),
             gif_provider: GifProvider::Local,
             gif_import_paths: Vec::new(),
             theme: ThemeSelection::Preset(preset),
@@ -178,6 +346,8 @@ impl UiSettings {
         let previous = self.clone();
         *self = UiSettings::from_preset(preset);
         self.interface_mode = previous.interface_mode;
+        self.features = previous.features;
+        self.hotkeys = previous.hotkeys;
         self.gif_provider = previous.gif_provider;
         self.gif_import_paths = previous.gif_import_paths;
         self.custom_themes = previous.custom_themes;
@@ -342,6 +512,7 @@ pub(crate) fn settings_path() -> Option<PathBuf> {
 pub(crate) fn load_settings(path: &Path) -> Option<UiSettings> {
     let content = fs::read_to_string(path).ok()?;
     let mut settings: UiSettings = serde_json::from_str(&content).ok()?;
+    settings.features.ensure_any_content_enabled();
 
     if !content.contains("\"interface_mode\"") && settings.preset == Preset::DefaultGray {
         let color_emoji = settings.color_emoji;
@@ -414,37 +585,71 @@ fn sanitize_theme_name(value: &str) -> String {
     value.trim().chars().take(48).collect()
 }
 
-pub(crate) fn configure_fonts(ctx: &Context) {
+pub(crate) fn hotkey_key_label(key: &str) -> &str {
+    match key {
+        "Period" => ".",
+        "Comma" => ",",
+        "Slash" => "/",
+        "Backslash" => "\\",
+        "Minus" => "-",
+        "Equal" => "=",
+        "Semicolon" => ";",
+        "Quote" => "'",
+        "Backquote" => "`",
+        "Space" => "Space",
+        "Enter" => "Enter",
+        "Tab" => "Tab",
+        "Escape" => "Esc",
+        "ArrowUp" => "Up",
+        "ArrowDown" => "Down",
+        "ArrowLeft" => "Left",
+        "ArrowRight" => "Right",
+        "BracketLeft" => "[",
+        "BracketRight" => "]",
+        value if value.starts_with("Key") && value.len() == 4 => &value[3..],
+        value if value.starts_with("Digit") && value.len() == 6 => &value[5..],
+        value => value,
+    }
+}
+
+pub(crate) fn configure_fonts(ctx: &Context, settings: &UiSettings) {
     let mut fonts = FontDefinitions::default();
 
-    for (name, path) in [
+    let mut font_paths = vec![
         ("NotoSans", "/usr/share/fonts/noto/NotoSans-Regular.ttf"),
-        (
-            "NotoSansSymbols2",
-            "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
-        ),
-        (
-            "NotoSansSymbols",
-            "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf",
-        ),
-        (
-            "NotoSansMath",
-            "/usr/share/fonts/noto/NotoSansMath-Regular.ttf",
-        ),
-        (
-            "NotoSansArabic",
-            "/usr/share/fonts/noto/NotoSansArabic-Regular.ttf",
-        ),
-        (
-            "NotoSansHebrew",
-            "/usr/share/fonts/noto/NotoSansHebrew-Regular.ttf",
-        ),
-        (
-            "NotoSansCJK",
-            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-        ),
         ("DejaVuSans", "/usr/share/fonts/TTF/DejaVuSans.ttf"),
-    ] {
+    ];
+
+    if settings.features.symbols {
+        font_paths.extend([
+            (
+                "NotoSansSymbols2",
+                "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
+            ),
+            (
+                "NotoSansSymbols",
+                "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf",
+            ),
+            (
+                "NotoSansMath",
+                "/usr/share/fonts/noto/NotoSansMath-Regular.ttf",
+            ),
+            (
+                "NotoSansArabic",
+                "/usr/share/fonts/noto/NotoSansArabic-Regular.ttf",
+            ),
+            (
+                "NotoSansHebrew",
+                "/usr/share/fonts/noto/NotoSansHebrew-Regular.ttf",
+            ),
+            (
+                "NotoSansCJK",
+                "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+            ),
+        ]);
+    }
+
+    for (name, path) in font_paths {
         let Ok(bytes) = fs::read(path) else {
             continue;
         };

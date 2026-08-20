@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     fs, io,
     path::{Path, PathBuf},
     process::Command,
@@ -14,6 +14,8 @@ use crate::{
     data::{DataSource, EmojiGroup, Entry, StoredEntry, load_entries, load_recent, recent_path},
     dev_metrics::DevMetricsSampler,
     emoji_cache::EmojiCache,
+    global_hotkeys::GlobalHotkeyRuntime,
+    ipc::{IpcCommand, IpcServer},
     media_clipboard::MediaClipboard,
     media_drag::{DragOutBackend, DragPreview, LinuxDragOutBackend},
     media_library::{
@@ -26,7 +28,8 @@ use crate::{
     media_preview::MediaPreviewCache,
     preflight::{PreflightReport, StartupWarning},
     settings::{
-        UiSettings, configure_fonts, configure_style, load_settings, save_settings, settings_path,
+        FeatureSettings, HotkeyAction, UiSettings, configure_fonts, configure_style, load_settings,
+        save_settings, settings_path,
     },
     telegram_stickers::{
         TELEGRAM_BOT_TOKEN_ENV, TelegramStickerImportSummary, clear_saved_telegram_bot_token,
@@ -85,6 +88,9 @@ enum MediaScanRequest {
         generation: u64,
         paths: Vec<PathBuf>,
         index_path: Option<PathBuf>,
+        include_gifs: bool,
+        include_stickers: bool,
+        deduplicate: bool,
     },
 }
 
@@ -94,6 +100,15 @@ enum MediaScanResult {
         items: Vec<MediaItem>,
         index_save_error: Option<String>,
     },
+}
+
+enum MediaWatchRequest {
+    Watch { paths: Vec<PathBuf> },
+    Stop,
+}
+
+enum MediaWatchResult {
+    Changed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -203,6 +218,7 @@ pub(crate) struct SymbolisApp {
     pub(crate) media_items: Vec<MediaItem>,
     pub(crate) recent_media: Vec<MediaItem>,
     pub(crate) favorite_media_ids: Vec<String>,
+    pub(crate) selected_media_ids: HashSet<String>,
     pub(crate) app_view: AppView,
     pub(crate) content_mode: ContentMode,
     pub(crate) selected_tab: Tab,
@@ -216,6 +232,9 @@ pub(crate) struct SymbolisApp {
     pub(crate) telegram_bot_token_guide_visible: bool,
     pub(crate) dev_panel_open: bool,
     pub(crate) clear_everything_confirm: bool,
+    pub(crate) capture_hotkey_action: Option<HotkeyAction>,
+    pub(crate) hidden_to_background: bool,
+    pub(crate) allow_close: bool,
     pub(crate) dev_metrics: DevMetricsSampler,
     pub(crate) app_started_at: Instant,
     pub(crate) dev_log: VecDeque<DevLogEntry>,
@@ -233,11 +252,15 @@ pub(crate) struct SymbolisApp {
     pub(crate) settings: UiSettings,
     pub(crate) emoji_cache: EmojiCache,
     pub(crate) media_preview_cache: MediaPreviewCache,
+    pub(crate) global_hotkeys: GlobalHotkeyRuntime,
+    pub(crate) ipc_server: Option<IpcServer>,
     media_job_tx: Sender<MediaJobRequest>,
     media_job_rx: Receiver<MediaJobResult>,
     active_media_jobs: usize,
     media_scan_tx: Sender<MediaScanRequest>,
     media_scan_rx: Receiver<MediaScanResult>,
+    media_watch_tx: Sender<MediaWatchRequest>,
+    media_watch_rx: Receiver<MediaWatchResult>,
     active_media_scans: usize,
     media_scan_generation: u64,
     media_scan_completion_status: Option<(u64, String)>,
@@ -247,22 +270,27 @@ impl SymbolisApp {
     pub(crate) fn new(
         cc: &eframe::CreationContext<'_>,
         preflight: PreflightReport,
+        initial_command: Option<IpcCommand>,
     ) -> Result<Self, String> {
-        configure_fonts(&cc.egui_ctx);
-
         let settings_path = settings_path();
-        let settings = settings_path
+        let mut settings = settings_path
             .as_deref()
             .and_then(load_settings)
             .unwrap_or_default();
+        settings.features.ensure_any_content_enabled();
+        configure_fonts(&cc.egui_ctx, &settings);
         configure_style(&cc.egui_ctx, &settings);
 
-        let (entries, data_source) = load_entries();
+        let (entries, data_source) = load_entries(settings.features.symbols);
         let recent_path = recent_path();
-        let recent = recent_path
-            .as_deref()
-            .and_then(load_recent)
-            .unwrap_or_default();
+        let recent = if settings.features.symbols {
+            recent_path
+                .as_deref()
+                .and_then(load_recent)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let recent_media_path = recent_media_path();
         let recent_media = load_recent_media(recent_media_path.as_deref());
         let favorite_media_path = favorite_media_path();
@@ -272,8 +300,11 @@ impl SymbolisApp {
         let telegram_bot_token_input = load_saved_telegram_bot_token().unwrap_or_default();
         let telegram_bot_token_saved = !telegram_bot_token_input.is_empty();
         let app_started_at = Instant::now();
+        let global_hotkeys = GlobalHotkeyRuntime::new(&settings.hotkeys, cc.egui_ctx.clone());
+        let ipc_server = IpcServer::start(cc.egui_ctx.clone()).ok();
         let (media_job_tx, media_job_rx) = spawn_media_worker();
         let (media_scan_tx, media_scan_rx) = spawn_media_scan_worker();
+        let (media_watch_tx, media_watch_rx) = spawn_media_watch_worker();
         let clipboard = MediaClipboard::new()
             .map_err(|err| format!("Clipboard backend became unavailable: {err}"))?;
 
@@ -283,8 +314,9 @@ impl SymbolisApp {
             media_items,
             recent_media,
             favorite_media_ids,
+            selected_media_ids: HashSet::new(),
             app_view: AppView::Main,
-            content_mode: ContentMode::Symbols,
+            content_mode: first_enabled_content_mode(&settings.features),
             selected_tab: Tab::Category(crate::data::Category::Emoji),
             media_view: MediaView::Library,
             selected_sticker_pack_id: None,
@@ -296,6 +328,9 @@ impl SymbolisApp {
             telegram_bot_token_guide_visible: false,
             dev_panel_open: false,
             clear_everything_confirm: false,
+            capture_hotkey_action: None,
+            hidden_to_background: false,
+            allow_close: false,
             dev_metrics: DevMetricsSampler::default(),
             app_started_at,
             dev_log: VecDeque::new(),
@@ -313,16 +348,25 @@ impl SymbolisApp {
             settings,
             emoji_cache: EmojiCache::new(preflight.color_emoji_renderer),
             media_preview_cache: MediaPreviewCache::new(),
+            global_hotkeys,
+            ipc_server,
             media_job_tx,
             media_job_rx,
             active_media_jobs: 0,
             media_scan_tx,
             media_scan_rx,
+            media_watch_tx,
+            media_watch_rx,
             active_media_scans: 0,
             media_scan_generation: 0,
             media_scan_completion_status: None,
         };
+        app.retain_enabled_media_state();
         app.reload_media_library();
+        app.update_media_watcher();
+        if let Some(command) = initial_command {
+            app.apply_ipc_command(command, &cc.egui_ctx);
+        }
         Ok(app)
     }
 
@@ -459,6 +503,45 @@ impl SymbolisApp {
             item.kind == MediaKind::Sticker && sticker_pack_id(item) == Some(selected.clone())
         }) {
             self.selected_sticker_pack_id = None;
+        }
+    }
+
+    fn ensure_content_mode_enabled(&mut self) {
+        if !self.content_mode_enabled(self.content_mode) {
+            self.content_mode = first_enabled_content_mode(&self.settings.features);
+        }
+    }
+
+    fn retain_enabled_media_state(&mut self) {
+        let features = self.settings.features.clone();
+        self.media_items
+            .retain(|item| media_item_enabled(item, &features));
+        self.recent_media
+            .retain(|item| item.path.exists() && media_item_enabled(item, &features));
+        self.favorite_media_ids.retain(|id| {
+            self.media_items
+                .iter()
+                .any(|item| item.id == *id && media_item_enabled(item, &features))
+        });
+        self.selected_media_ids.retain(|id| {
+            self.media_items
+                .iter()
+                .any(|item| item.id == *id && media_item_enabled(item, &features))
+        });
+        self.retain_existing_sticker_pack_selection();
+    }
+
+    fn update_media_watcher(&mut self) {
+        let request = if self.settings.features.gifs || self.settings.features.stickers {
+            MediaWatchRequest::Watch {
+                paths: media_scan_paths(&self.settings.gif_import_paths),
+            }
+        } else {
+            MediaWatchRequest::Stop
+        };
+
+        if self.media_watch_tx.send(request).is_err() {
+            self.log_dev("media watcher unavailable");
         }
     }
 
@@ -813,6 +896,7 @@ impl SymbolisApp {
 
         if added > 0 {
             self.save_settings();
+            self.update_media_watcher();
         }
         if accepted > 0 || queued > 0 {
             self.content_mode = imported_content_mode.unwrap_or(ContentMode::Gifs);
@@ -880,10 +964,12 @@ impl SymbolisApp {
             .gif_import_paths
             .retain(|existing| existing != path);
         self.save_settings();
+        self.update_media_watcher();
         self.queue_media_scan("Removed media source; indexing media library...");
     }
 
     pub(crate) fn reload_media_library(&mut self) {
+        self.update_media_watcher();
         self.queue_media_scan("Indexing media library...");
     }
 
@@ -913,6 +999,288 @@ impl SymbolisApp {
         if let Err(err) = save_settings(self.settings_path.as_deref(), &self.settings) {
             self.status = Some(format!("Settings save error: {err}"));
         }
+    }
+
+    pub(crate) fn rebuild_global_hotkeys(&mut self) {
+        self.global_hotkeys.rebuild(&self.settings.hotkeys);
+    }
+
+    pub(crate) fn global_hotkey_status(&self) -> &str {
+        self.global_hotkeys.status()
+    }
+
+    pub(crate) fn toggle_command_label(&self) -> String {
+        std::env::current_exe()
+            .map(|path| format!("{} {}", shell_quote(&path), IpcCommand::Toggle.arg()))
+            .unwrap_or_else(|_| format!("symbolis {}", IpcCommand::Toggle.arg()))
+    }
+
+    pub(crate) fn copy_toggle_command(&mut self) {
+        let command = self.toggle_command_label();
+        match self.clipboard.copy_text(command) {
+            Ok(()) => {
+                self.status = Some("Copied toggle command".to_owned());
+            }
+            Err(err) => {
+                self.status = Some(format!("Clipboard error: {err}"));
+            }
+        }
+    }
+
+    pub(crate) fn install_toggle_desktop_launcher(&mut self) {
+        match self.write_toggle_desktop_launcher() {
+            Ok(desktop_path) => {
+                self.status = Some(format!(
+                    "Installed launcher {}; bind it in your desktop shortcuts",
+                    desktop_path.display()
+                ));
+            }
+            Err(err) => {
+                self.status = Some(format!("Desktop launcher install error: {err}"));
+            }
+        }
+    }
+
+    pub(crate) fn apply_kde_toggle_shortcut(&mut self) {
+        let Some(binding) = self.settings.hotkeys.binding(HotkeyAction::Main) else {
+            self.status = Some("Set global hotkey first".to_owned());
+            return;
+        };
+        let Some(sequence) = kde_key_sequence(binding) else {
+            self.status = Some("Set global hotkey key first".to_owned());
+            return;
+        };
+        let Some(kwriteconfig) = command_exists("kwriteconfig6")
+            .then_some("kwriteconfig6")
+            .or_else(|| command_exists("kwriteconfig5").then_some("kwriteconfig5"))
+        else {
+            self.status =
+                Some("KDE shortcut install needs kwriteconfig6 or kwriteconfig5".to_owned());
+            return;
+        };
+
+        if let Err(err) = self.write_toggle_desktop_launcher() {
+            self.status = Some(format!("KDE shortcut launcher error: {err}"));
+            return;
+        }
+
+        let launch_value = format!("{sequence},none,Symbolis Toggle");
+        let commands = [
+            Command::new(kwriteconfig)
+                .arg("--file")
+                .arg("kglobalshortcutsrc")
+                .arg("--group")
+                .arg("symbolis-toggle.desktop")
+                .arg("--key")
+                .arg("_k_friendly_name")
+                .arg("Symbolis Toggle")
+                .output(),
+            Command::new(kwriteconfig)
+                .arg("--file")
+                .arg("kglobalshortcutsrc")
+                .arg("--group")
+                .arg("symbolis-toggle.desktop")
+                .arg("--key")
+                .arg("_launch")
+                .arg(&launch_value)
+                .output(),
+        ];
+
+        for result in commands {
+            match result {
+                Ok(output) if output.status.success() => {}
+                Ok(output) => {
+                    self.status = Some(format!(
+                        "KDE shortcut install error: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ));
+                    return;
+                }
+                Err(err) => {
+                    self.status = Some(format!("KDE shortcut install error: {err}"));
+                    return;
+                }
+            }
+        }
+
+        restart_kde_global_accel();
+        self.status = Some(format!("Applied KDE shortcut: {sequence}"));
+    }
+
+    fn write_toggle_desktop_launcher(&self) -> Result<PathBuf, String> {
+        let Some(data_dir) = dirs::data_dir() else {
+            return Err("data dir unavailable".to_owned());
+        };
+        let desktop_dir = data_dir.join("applications");
+        let desktop_path = desktop_dir.join("symbolis-toggle.desktop");
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("symbolis"));
+        let content = format!(
+            "[Desktop Entry]\nType=Application\nName=Symbolis Toggle\nComment=Toggle Symbolis picker window\nExec={} {}\nTerminal=false\nNoDisplay=true\nStartupNotify=false\nCategories=Utility;\nX-KDE-GlobalAccel-CommandShortcut=true\n",
+            desktop_exec_quote(&exe),
+            IpcCommand::Toggle.arg()
+        );
+
+        fs::create_dir_all(&desktop_dir)
+            .and_then(|_| fs::write(&desktop_path, content))
+            .map_err(|err| err.to_string())?;
+        Ok(desktop_path)
+    }
+
+    pub(crate) fn apply_feature_settings(&mut self, ctx: &Context) {
+        self.settings.features.ensure_any_content_enabled();
+        configure_fonts(ctx, &self.settings);
+        let (entries, data_source) = load_entries(self.settings.features.symbols);
+        self.entries = entries;
+        self.data_source = data_source;
+        if !self.settings.features.symbols {
+            self.recent.clear();
+            self.selected_tab = Tab::Category(crate::data::Category::Emoji);
+        }
+
+        self.ensure_content_mode_enabled();
+        self.retain_enabled_media_state();
+        self.update_media_watcher();
+        self.reload_media_library();
+    }
+
+    pub(crate) fn content_mode_enabled(&self, mode: ContentMode) -> bool {
+        content_mode_enabled(mode, &self.settings.features)
+    }
+
+    pub(crate) fn selected_media_count(&self) -> usize {
+        self.selected_media_ids.len()
+    }
+
+    pub(crate) fn is_media_selected(&self, item: &MediaItem) -> bool {
+        self.selected_media_ids.contains(&item.id)
+    }
+
+    pub(crate) fn toggle_media_selected(&mut self, item: &MediaItem) {
+        if !self.selected_media_ids.insert(item.id.clone()) {
+            self.selected_media_ids.remove(&item.id);
+        }
+    }
+
+    pub(crate) fn select_filtered_media(&mut self) {
+        let ids = self
+            .filtered_media_sources()
+            .into_iter()
+            .filter_map(|source| self.media_item_from_source(source))
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        self.selected_media_ids.extend(ids);
+        self.status = Some(format!(
+            "Selected {} media item{}",
+            self.selected_media_ids.len(),
+            plural_suffix(self.selected_media_ids.len())
+        ));
+    }
+
+    pub(crate) fn clear_media_selection(&mut self) {
+        self.selected_media_ids.clear();
+        self.status = None;
+    }
+
+    pub(crate) fn add_selected_media_to_favorites(&mut self) {
+        let selected_ids = self.selected_media_ids.clone();
+        let mut added = 0;
+        for item in self
+            .media_items
+            .iter()
+            .filter(|item| selected_ids.contains(&item.id))
+        {
+            if !self.favorite_media_ids.contains(&item.id) {
+                self.favorite_media_ids.insert(0, item.id.clone());
+                added += 1;
+            }
+        }
+        self.favorite_media_ids.truncate(512);
+        if let Err(err) = self.save_favorite_media_ids() {
+            self.status = Some(format!("Favorites save error: {err}"));
+            return;
+        }
+        self.status = Some(format!(
+            "Added {added} selected media item{} to favorites",
+            plural_suffix(added)
+        ));
+    }
+
+    pub(crate) fn remove_selected_media_from_favorites(&mut self) {
+        let selected_ids = self.selected_media_ids.clone();
+        let before = self.favorite_media_ids.len();
+        self.favorite_media_ids
+            .retain(|id| !selected_ids.contains(id));
+        let removed = before.saturating_sub(self.favorite_media_ids.len());
+        if let Err(err) = self.save_favorite_media_ids() {
+            self.status = Some(format!("Favorites save error: {err}"));
+            return;
+        }
+        self.status = Some(format!(
+            "Removed {removed} selected favorite{}",
+            plural_suffix(removed)
+        ));
+    }
+
+    pub(crate) fn delete_selected_media_files(&mut self) {
+        let selected_ids = self.selected_media_ids.clone();
+        let items = self
+            .media_items
+            .iter()
+            .filter(|item| selected_ids.contains(&item.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            self.selected_media_ids.clear();
+            self.status = Some("No selected library media to delete".to_owned());
+            return;
+        }
+
+        let mut deleted = 0;
+        let mut missing = 0;
+        let mut errors = Vec::new();
+        for item in &items {
+            match std::fs::remove_file(&item.path) {
+                Ok(()) => deleted += 1,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => missing += 1,
+                Err(err) => errors.push(format!("{}: {err}", item.title)),
+            }
+        }
+
+        self.selected_media_ids.clear();
+        self.favorite_media_ids
+            .retain(|id| !selected_ids.contains(id));
+        self.recent_media
+            .retain(|item| !selected_ids.contains(&item.id));
+        if let Err(err) = self.save_favorite_media_ids() {
+            self.status = Some(format!("Favorites save error: {err}"));
+            return;
+        }
+        if let Err(err) = self.save_recent_media() {
+            self.status = Some(format!("Recent media save error: {err}"));
+            return;
+        }
+
+        let mut status = format!(
+            "Deleted {deleted} selected media file{}",
+            plural_suffix(deleted)
+        );
+        if missing > 0 {
+            status.push_str(&format!(
+                "; removed {missing} missing file{}",
+                plural_suffix(missing)
+            ));
+        }
+        if !errors.is_empty() {
+            status.push_str(&format!(
+                "; {} delete error{}",
+                errors.len(),
+                plural_suffix(errors.len())
+            ));
+        }
+        if let Some(first_error) = errors.first() {
+            status.push_str(&format!(": {first_error}"));
+        }
+        self.queue_media_scan(format!("{status}; reindexing media library..."));
     }
 
     pub(crate) fn delivery_status(&self) -> String {
@@ -1019,6 +1387,7 @@ impl SymbolisApp {
         self.recent_media.clear();
         self.favorite_media_ids.clear();
         self.settings = UiSettings::default();
+        self.update_media_watcher();
         self.app_view = AppView::Main;
         self.content_mode = ContentMode::Symbols;
         self.selected_tab = Tab::Category(crate::data::Category::Emoji);
@@ -1031,6 +1400,7 @@ impl SymbolisApp {
         self.telegram_bot_token_saved = false;
         self.telegram_bot_token_guide_visible = false;
         self.clear_everything_confirm = false;
+        self.capture_hotkey_action = None;
         self.pending_sticker_pack_delete = None;
         self.dev_log.clear();
         self.emoji_cache = EmojiCache::new(self.emoji_cache.color_renderer_available());
@@ -1136,6 +1506,9 @@ impl SymbolisApp {
             generation,
             paths: media_scan_paths(&self.settings.gif_import_paths),
             index_path: self.media_index_path.clone(),
+            include_gifs: self.settings.features.gifs,
+            include_stickers: self.settings.features.stickers,
+            deduplicate: true,
         };
         self.active_media_scans += 1;
         if self.media_scan_tx.send(request).is_ok() {
@@ -1180,6 +1553,138 @@ impl SymbolisApp {
         }
     }
 
+    fn poll_media_watcher(&mut self) {
+        let mut changed = false;
+        while self.media_watch_rx.try_recv().is_ok() {
+            changed = true;
+        }
+
+        if changed {
+            self.queue_media_scan("Media folder changed; indexing media library...");
+        }
+    }
+
+    fn poll_global_hotkeys(&mut self, ctx: &Context) {
+        for action in self.global_hotkeys.poll() {
+            self.activate_global_hotkey(action, ctx);
+        }
+    }
+
+    fn poll_ipc_commands(&mut self, ctx: &Context) {
+        let mut commands = Vec::new();
+        if let Some(server) = &self.ipc_server {
+            while let Some(command) = server.try_recv() {
+                commands.push(command);
+            }
+        }
+
+        for command in commands {
+            self.apply_ipc_command(command, ctx);
+        }
+    }
+
+    fn apply_ipc_command(&mut self, command: IpcCommand, ctx: &Context) {
+        match command {
+            IpcCommand::Toggle => self.toggle_window(ctx),
+            IpcCommand::ShowMain => {
+                self.show_window(ctx);
+                self.app_view = AppView::Main;
+                self.ensure_content_mode_enabled();
+            }
+            IpcCommand::ShowSymbols => {
+                self.show_window(ctx);
+                self.activate_global_hotkey(HotkeyAction::Symbols, ctx);
+            }
+            IpcCommand::ShowStickers => {
+                self.show_window(ctx);
+                self.activate_global_hotkey(HotkeyAction::Stickers, ctx);
+            }
+            IpcCommand::ShowGifs => {
+                self.show_window(ctx);
+                self.activate_global_hotkey(HotkeyAction::Gifs, ctx);
+            }
+            IpcCommand::Quit => {
+                self.allow_close = true;
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
+        }
+    }
+
+    fn toggle_window(&mut self, ctx: &Context) {
+        let minimized = ctx.input(|input| input.viewport().minimized.unwrap_or(false));
+        let focused = ctx.input(|input| input.viewport().focused.unwrap_or(false));
+        if self.hidden_to_background || minimized || !focused {
+            self.show_window(ctx);
+        } else {
+            self.hide_window(ctx);
+        }
+    }
+
+    fn show_window(&mut self, ctx: &Context) {
+        self.hidden_to_background = false;
+        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(ViewportCommand::Focus);
+        ctx.request_repaint();
+    }
+
+    pub(crate) fn hide_window(&mut self, ctx: &Context) {
+        self.hidden_to_background = true;
+        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        ctx.request_repaint();
+    }
+
+    pub(crate) fn quit_app(&mut self, ctx: &Context) {
+        self.allow_close = true;
+        ctx.send_viewport_cmd(ViewportCommand::Close);
+    }
+
+    fn activate_global_hotkey(&mut self, action: HotkeyAction, ctx: &Context) {
+        self.show_window(ctx);
+
+        self.app_view = AppView::Main;
+        match action {
+            HotkeyAction::Main => {
+                self.ensure_content_mode_enabled();
+            }
+            HotkeyAction::Symbols => {
+                if self.settings.features.symbols {
+                    self.content_mode = ContentMode::Symbols;
+                    self.selected_tab = Tab::Category(crate::data::Category::Emoji);
+                } else {
+                    self.content_mode = first_enabled_content_mode(&self.settings.features);
+                }
+            }
+            HotkeyAction::Stickers => {
+                if self.settings.features.stickers {
+                    self.content_mode = ContentMode::Stickers;
+                    self.media_view = MediaView::Library;
+                } else {
+                    self.content_mode = first_enabled_content_mode(&self.settings.features);
+                }
+            }
+            HotkeyAction::Gifs => {
+                if self.settings.features.gifs {
+                    self.content_mode = ContentMode::Gifs;
+                    self.media_view = MediaView::Library;
+                } else {
+                    self.content_mode = first_enabled_content_mode(&self.settings.features);
+                }
+            }
+        }
+
+        self.status = Some(format!("Opened via {}", action.label()));
+    }
+
+    fn handle_close_request(&mut self, ctx: &Context) {
+        if self.allow_close || !ctx.input(|input| input.viewport().close_requested()) {
+            return;
+        }
+
+        ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+        self.hide_window(ctx);
+    }
+
     fn handle_media_scan_result(&mut self, result: MediaScanResult) {
         let MediaScanResult::Complete {
             generation,
@@ -1197,7 +1702,7 @@ impl SymbolisApp {
 
         let item_count = items.len();
         self.media_items = items;
-        self.retain_existing_sticker_pack_selection();
+        self.retain_enabled_media_state();
         let completion_status = self
             .media_scan_completion_status
             .take()
@@ -1325,6 +1830,14 @@ impl SymbolisApp {
     }
 
     fn handle_keyboard(&mut self, ctx: &Context) {
+        if self.capture_hotkey_action.is_some() {
+            if ctx.input(|input| input.key_pressed(Key::Escape)) {
+                self.capture_hotkey_action = None;
+                self.status = Some("Global hotkey capture cancelled".to_owned());
+            }
+            return;
+        }
+
         if ctx.input(|input| input.key_pressed(Key::F7)) {
             self.dev_panel_open = !self.dev_panel_open;
             self.clear_everything_confirm = false;
@@ -1460,6 +1973,80 @@ fn spawn_media_scan_worker() -> (Sender<MediaScanRequest>, Receiver<MediaScanRes
     (scan_tx, result_rx)
 }
 
+fn spawn_media_watch_worker() -> (Sender<MediaWatchRequest>, Receiver<MediaWatchResult>) {
+    let (request_tx, request_rx) = mpsc::channel::<MediaWatchRequest>();
+    let (result_tx, result_rx) = mpsc::channel::<MediaWatchResult>();
+
+    thread::spawn(move || run_media_watch_worker(request_rx, result_tx));
+
+    (request_tx, result_rx)
+}
+
+fn run_media_watch_worker(
+    request_rx: Receiver<MediaWatchRequest>,
+    result_tx: Sender<MediaWatchResult>,
+) {
+    use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+
+    let (event_tx, event_rx) = mpsc::channel::<notify::Result<notify::Event>>();
+    let mut watcher: Option<RecommendedWatcher> = None;
+
+    loop {
+        match request_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(MediaWatchRequest::Watch { paths }) => {
+                watcher = RecommendedWatcher::new(
+                    {
+                        let event_tx = event_tx.clone();
+                        move |result| {
+                            let _ = event_tx.send(result);
+                        }
+                    },
+                    Config::default(),
+                )
+                .ok();
+
+                if let Some(watcher) = watcher.as_mut() {
+                    for target in media_watch_targets(&paths) {
+                        let mode = if target.is_dir() {
+                            RecursiveMode::Recursive
+                        } else {
+                            RecursiveMode::NonRecursive
+                        };
+                        let _ = watcher.watch(&target, mode);
+                    }
+                }
+            }
+            Ok(MediaWatchRequest::Stop) => {
+                watcher = None;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        let _watcher_is_active = watcher.is_some();
+
+        let mut changed = false;
+        while let Ok(event) = event_rx.try_recv() {
+            let Ok(event) = event else {
+                continue;
+            };
+            if matches!(
+                event.kind,
+                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) | EventKind::Any
+            ) {
+                changed = true;
+            }
+        }
+
+        if changed {
+            thread::sleep(Duration::from_millis(500));
+            while event_rx.try_recv().is_ok() {}
+            if result_tx.send(MediaWatchResult::Changed).is_err() {
+                break;
+            }
+        }
+    }
+}
+
 fn run_media_job(job: MediaJobRequest) -> MediaJobResult {
     match job {
         MediaJobRequest::StoredImport { original } => {
@@ -1492,8 +2079,15 @@ fn run_media_scan(request: MediaScanRequest) -> MediaScanResult {
             generation,
             paths,
             index_path,
+            include_gifs,
+            include_stickers,
+            deduplicate,
         } => {
-            let items = scan_media_library(&paths);
+            let mut items = scan_media_library(&paths, deduplicate);
+            items.retain(|item| match item.kind {
+                MediaKind::Gif => include_gifs,
+                MediaKind::Sticker => include_stickers,
+            });
             let index_save_error = save_media_index(index_path.as_deref(), &items)
                 .err()
                 .map(|err| err.to_string());
@@ -1643,8 +2237,12 @@ fn transfer_mime_for_path<'a>(path: &std::path::Path, item: &'a MediaItem) -> &'
 impl eframe::App for SymbolisApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         configure_style(ctx, &self.settings);
+        self.handle_close_request(ctx);
         self.poll_media_jobs();
         self.poll_media_scans();
+        self.poll_media_watcher();
+        self.poll_ipc_commands(ctx);
+        self.poll_global_hotkeys(ctx);
         self.request_media_job_repaint(ctx);
         self.handle_dropped_media(ctx);
         self.handle_keyboard(ctx);
@@ -1656,6 +2254,119 @@ fn media_scan_paths(import_paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut paths = default_media_paths();
     paths.extend(import_paths.iter().cloned());
     paths
+}
+
+fn media_watch_targets(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut targets = Vec::new();
+
+    for path in paths {
+        let target = if path.is_file() {
+            path.parent().map(Path::to_path_buf)
+        } else if path.exists() {
+            Some(path.clone())
+        } else {
+            path.parent()
+                .filter(|parent| parent.exists())
+                .map(Path::to_path_buf)
+        };
+
+        let Some(target) = target else {
+            continue;
+        };
+        let target = fs::canonicalize(&target).unwrap_or(target);
+        if seen.insert(target.clone()) {
+            targets.push(target);
+        }
+    }
+
+    targets
+}
+
+fn first_enabled_content_mode(features: &FeatureSettings) -> ContentMode {
+    if features.symbols {
+        ContentMode::Symbols
+    } else if features.stickers {
+        ContentMode::Stickers
+    } else {
+        ContentMode::Gifs
+    }
+}
+
+fn content_mode_enabled(mode: ContentMode, features: &FeatureSettings) -> bool {
+    match mode {
+        ContentMode::Symbols => features.symbols,
+        ContentMode::Stickers => features.stickers,
+        ContentMode::Gifs => features.gifs,
+    }
+}
+
+fn media_item_enabled(item: &MediaItem, features: &FeatureSettings) -> bool {
+    match item.kind {
+        MediaKind::Gif => features.gifs,
+        MediaKind::Sticker => features.stickers,
+    }
+}
+
+fn shell_quote(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':'))
+    {
+        value.into_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn desktop_exec_quote(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    if value.contains(' ') || value.contains('"') || value.contains('\\') {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        value.into_owned()
+    }
+}
+
+fn kde_key_sequence(binding: &crate::settings::HotkeyBinding) -> Option<String> {
+    if binding.key.trim().is_empty() {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    if binding.control {
+        parts.push("Ctrl".to_owned());
+    }
+    if binding.alt {
+        parts.push("Alt".to_owned());
+    }
+    if binding.shift {
+        parts.push("Shift".to_owned());
+    }
+    if binding.super_key {
+        parts.push("Meta".to_owned());
+    }
+    parts.push(crate::settings::hotkey_key_label(&binding.key).to_owned());
+    Some(parts.join("+"))
+}
+
+fn command_exists(command: &str) -> bool {
+    Command::new(command).arg("--version").output().is_ok()
+}
+
+fn restart_kde_global_accel() {
+    if command_exists("systemctl") {
+        let _ = Command::new("systemctl")
+            .arg("--user")
+            .arg("restart")
+            .arg("plasma-kglobalaccel.service")
+            .output();
+    } else if command_exists("kquitapp6") {
+        let _ = Command::new("kquitapp6").arg("kglobalaccel").output();
+    } else if command_exists("kquitapp5") {
+        let _ = Command::new("kquitapp5").arg("kglobalaccel").output();
+    }
 }
 
 fn symbolis_data_root() -> Option<PathBuf> {

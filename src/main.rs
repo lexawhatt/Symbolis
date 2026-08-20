@@ -3,6 +3,8 @@ mod data;
 mod dev_metrics;
 mod emoji_cache;
 mod gif_provider;
+mod global_hotkeys;
+mod ipc;
 mod media_clipboard;
 mod media_drag;
 mod media_library;
@@ -14,6 +16,7 @@ mod ui;
 
 use app::SymbolisApp;
 use eframe::egui::{self, Align, CentralPanel, Layout, RichText, ViewportBuilder};
+use ipc::IpcCommand;
 use preflight::LinuxSession;
 
 #[cfg(target_os = "linux")]
@@ -22,6 +25,17 @@ use winit::platform::{wayland::EventLoopBuilderExtWayland, x11::EventLoopBuilder
 const APP_NAME: &str = "Symbolis";
 
 fn main() -> eframe::Result {
+    let launch_command = parse_launch_command();
+    if let Some(command) = launch_command
+        && ipc::send_command(command).is_ok()
+    {
+        return Ok(());
+    }
+
+    if launch_command.is_none() && ipc::send_command(IpcCommand::ShowMain).is_ok() {
+        return Ok(());
+    }
+
     let preflight = match preflight::run_startup_preflight() {
         Ok(report) => report,
         Err(err) => {
@@ -36,11 +50,25 @@ fn main() -> eframe::Result {
     eframe::run_native(
         APP_NAME,
         options,
-        Box::new(|cc| match SymbolisApp::new(cc, preflight) {
-            Ok(app) => Ok(Box::new(app)),
-            Err(message) => Ok(Box::new(StartupErrorApp { message })),
-        }),
+        Box::new(
+            move |cc| match SymbolisApp::new(cc, preflight, launch_command) {
+                Ok(app) => Ok(Box::new(app)),
+                Err(message) => Ok(Box::new(StartupErrorApp { message })),
+            },
+        ),
     )
+}
+
+fn parse_launch_command() -> Option<IpcCommand> {
+    std::env::args().skip(1).find_map(|arg| match arg.as_str() {
+        "--toggle" => Some(IpcCommand::Toggle),
+        "--show-main" => Some(IpcCommand::ShowMain),
+        "--show-symbols" => Some(IpcCommand::ShowSymbols),
+        "--show-stickers" => Some(IpcCommand::ShowStickers),
+        "--show-gifs" => Some(IpcCommand::ShowGifs),
+        "--quit" => Some(IpcCommand::Quit),
+        _ => None,
+    })
 }
 
 fn run_startup_error_window(message: String) -> eframe::Result {
