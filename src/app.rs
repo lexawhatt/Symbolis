@@ -3,8 +3,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     process::Command,
-    sync::mpsc::{self, Receiver, Sender},
-    thread,
+    sync::mpsc::{Receiver, Sender},
     time::{Duration, Instant},
 };
 
@@ -19,23 +18,27 @@ use crate::{
     media_clipboard::MediaClipboard,
     media_drag::{DragOutBackend, DragPreview, LinuxDragOutBackend},
     media_library::{
-        MediaFormat, MediaItem, MediaKind, default_media_paths, export_media_for_transfer,
-        favorite_media_path, is_supported_media_path, load_favorite_media_ids, load_media_index,
-        load_recent_media, media_index_path, media_root, normalize_import_path, recent_media_path,
-        save_favorite_media_ids, save_media_as_webm, save_media_index, save_recent_media,
-        scan_media_library, store_media_file_for_library,
+        MediaFormat, MediaItem, MediaKind, default_media_paths, favorite_media_path,
+        is_supported_media_path, load_favorite_media_ids, load_media_index, load_recent_media,
+        media_index_path, media_root, normalize_import_path, recent_media_path,
+        save_favorite_media_ids, save_recent_media,
     },
     media_preview::MediaPreviewCache,
+    media_runtime::{
+        MediaJobRequest, MediaJobResult, MediaScanOptions, MediaScanRequest, MediaScanResult,
+        MediaWatchRequest, MediaWatchResult, media_job_request_label, media_job_result_is_terminal,
+        media_job_result_label, media_path_label, spawn_media_scan_worker,
+        spawn_media_watch_worker, spawn_media_worker,
+    },
     preflight::{PreflightReport, StartupWarning},
     settings::{
         FeatureSettings, HotkeyAction, UiSettings, configure_fonts, configure_style, load_settings,
         save_settings, settings_path,
     },
     telegram_stickers::{
-        TELEGRAM_BOT_TOKEN_ENV, TelegramStickerImportSummary, clear_saved_telegram_bot_token,
-        import_telegram_sticker_set, import_telegram_sticker_set_with_progress,
-        load_saved_telegram_bot_token, save_telegram_bot_token, sticker_set_name_from_input,
-        telegram_bot_token, telegram_bot_token_from_env, telegram_secret_path,
+        TELEGRAM_BOT_TOKEN_ENV, clear_saved_telegram_bot_token, load_saved_telegram_bot_token,
+        save_telegram_bot_token, sticker_set_name_from_input, telegram_bot_token,
+        telegram_bot_token_from_env, telegram_secret_path,
     },
 };
 
@@ -48,67 +51,55 @@ enum MediaImportMode {
     StoreFiles,
 }
 
-enum MediaJobRequest {
-    StoredImport { original: PathBuf },
-    OptimizedCopy { item: MediaItem, title: String },
-    ExportForCopy { item: MediaItem },
-    ExportForDrag { item: MediaItem },
-    ImportTelegramStickerSet { set_name: String, token: String },
+#[derive(Default)]
+struct MediaDeletionSummary {
+    deleted: usize,
+    missing: usize,
+    errors: Vec<String>,
 }
 
-enum MediaJobResult {
-    StoredImport {
-        original: PathBuf,
-        result: Result<PathBuf, String>,
-    },
-    OptimizedCopy {
-        title: String,
-        result: Result<PathBuf, String>,
-    },
-    ExportForCopy {
-        item: MediaItem,
-        result: Result<PathBuf, String>,
-    },
-    ExportForDrag {
-        item: MediaItem,
-        result: Result<PathBuf, String>,
-    },
-    TelegramStickerImport {
-        set_name: String,
-        result: Result<TelegramStickerImportSummary, String>,
-    },
-    TelegramStickerImportProgress {
-        set_name: String,
-        message: String,
-    },
-}
+impl MediaDeletionSummary {
+    fn delete_files(items: &[MediaItem]) -> Self {
+        let mut summary = Self::default();
 
-enum MediaScanRequest {
-    Scan {
-        generation: u64,
-        paths: Vec<PathBuf>,
-        index_path: Option<PathBuf>,
-        include_gifs: bool,
-        include_stickers: bool,
-        deduplicate: bool,
-    },
-}
+        for item in items {
+            match fs::remove_file(&item.path) {
+                Ok(()) => summary.deleted += 1,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => summary.missing += 1,
+                Err(err) => summary.errors.push(format!("{}: {err}", item.title)),
+            }
+        }
 
-enum MediaScanResult {
-    Complete {
-        generation: u64,
-        items: Vec<MediaItem>,
-        index_save_error: Option<String>,
-    },
-}
+        summary
+    }
 
-enum MediaWatchRequest {
-    Watch { paths: Vec<PathBuf> },
-    Stop,
-}
+    fn status(&self, prefix: impl Into<String>) -> String {
+        let mut status = format!(
+            "{}: {} file{}",
+            prefix.into(),
+            self.deleted,
+            plural_suffix(self.deleted)
+        );
+        if self.missing > 0 {
+            status.push_str(&format!(
+                "; removed {} missing file{}",
+                self.missing,
+                plural_suffix(self.missing)
+            ));
+        }
+        if !self.errors.is_empty() {
+            status.push_str(&format!(
+                "; {} delete error{}",
+                self.errors.len(),
+                plural_suffix(self.errors.len())
+            ));
+        }
+        if let Some(first_error) = self.errors.first() {
+            status.push_str(&format!(": {first_error}"));
+        }
 
-enum MediaWatchResult {
-    Changed,
+        status
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -138,6 +129,43 @@ impl ContentMode {
             ContentMode::Symbols => None,
             ContentMode::Stickers => Some(MediaKind::Sticker),
             ContentMode::Gifs => Some(MediaKind::Gif),
+        }
+    }
+
+    pub(crate) fn first_enabled(features: &FeatureSettings) -> Self {
+        if features.symbols {
+            Self::Symbols
+        } else if features.stickers {
+            Self::Stickers
+        } else {
+            Self::Gifs
+        }
+    }
+
+    pub(crate) fn enabled(self, features: &FeatureSettings) -> bool {
+        match self {
+            Self::Symbols => features.symbols,
+            Self::Stickers => features.stickers,
+            Self::Gifs => features.gifs,
+        }
+    }
+
+    fn for_media_kind(kind: MediaKind) -> Self {
+        match kind {
+            MediaKind::Gif => Self::Gifs,
+            MediaKind::Sticker => Self::Stickers,
+        }
+    }
+
+    fn for_media_path(path: &Path) -> Self {
+        match path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("png" | "webp") => Self::Stickers,
+            _ => Self::Gifs,
         }
     }
 }
@@ -316,7 +344,7 @@ impl SymbolisApp {
             favorite_media_ids,
             selected_media_ids: HashSet::new(),
             app_view: AppView::Main,
-            content_mode: first_enabled_content_mode(&settings.features),
+            content_mode: ContentMode::first_enabled(&settings.features),
             selected_tab: Tab::Category(crate::data::Category::Emoji),
             media_view: MediaView::Library,
             selected_sticker_pack_id: None,
@@ -507,8 +535,8 @@ impl SymbolisApp {
     }
 
     fn ensure_content_mode_enabled(&mut self) {
-        if !self.content_mode_enabled(self.content_mode) {
-            self.content_mode = first_enabled_content_mode(&self.settings.features);
+        if !self.content_mode.enabled(&self.settings.features) {
+            self.content_mode = ContentMode::first_enabled(&self.settings.features);
         }
     }
 
@@ -532,13 +560,14 @@ impl SymbolisApp {
     }
 
     fn update_media_watcher(&mut self) {
-        let request = if self.settings.features.gifs || self.settings.features.stickers {
-            MediaWatchRequest::Watch {
-                paths: media_scan_paths(&self.settings.gif_import_paths),
-            }
-        } else {
-            MediaWatchRequest::Stop
-        };
+        let request =
+            if self.settings.features.media_watcher && self.settings.features.media_enabled() {
+                MediaWatchRequest::Watch {
+                    paths: media_scan_paths(&self.settings.gif_import_paths),
+                }
+            } else {
+                MediaWatchRequest::Stop
+            };
 
         if self.media_watch_tx.send(request).is_err() {
             self.log_dev("media watcher unavailable");
@@ -684,7 +713,7 @@ impl SymbolisApp {
     pub(crate) fn delete_media_file(&mut self, item: &MediaItem) {
         let path = item.path.clone();
         let title = item.title.clone();
-        let file_was_missing = match std::fs::remove_file(&path) {
+        let file_was_missing = match fs::remove_file(&path) {
             Ok(()) => false,
             Err(err) if err.kind() == io::ErrorKind::NotFound => true,
             Err(err) => {
@@ -711,16 +740,11 @@ impl SymbolisApp {
             self.status = Some(format!("Settings save error: {err}"));
             return;
         }
-        if let Err(err) = self.save_favorite_media_ids() {
-            self.status = Some(format!("Favorites save error: {err}"));
-            return;
-        }
-        if let Err(err) = self.save_recent_media() {
-            self.status = Some(format!("Recent media save error: {err}"));
+        if !self.save_media_metadata() {
             return;
         }
 
-        self.content_mode = content_mode_for_media_kind(item.kind);
+        self.content_mode = ContentMode::for_media_kind(item.kind);
         let status = if file_was_missing {
             format!("Removed missing media: {title}")
         } else {
@@ -750,26 +774,15 @@ impl SymbolisApp {
             return;
         }
 
-        let mut deleted = 0;
-        let mut missing = 0;
-        let mut errors = Vec::new();
         let item_ids = pack_items
             .iter()
             .map(|item| item.id.clone())
-            .collect::<Vec<_>>();
+            .collect::<HashSet<_>>();
+        let deletion = MediaDeletionSummary::delete_files(&pack_items);
 
-        for item in &pack_items {
-            match std::fs::remove_file(&item.path) {
-                Ok(()) => deleted += 1,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => missing += 1,
-                Err(err) => errors.push(format!("{}: {err}", item.title)),
-            }
-        }
-
-        self.favorite_media_ids
-            .retain(|id| !item_ids.iter().any(|item_id| item_id == id));
+        self.favorite_media_ids.retain(|id| !item_ids.contains(id));
         self.recent_media
-            .retain(|existing| !item_ids.iter().any(|item_id| item_id == &existing.id));
+            .retain(|existing| !item_ids.contains(&existing.id));
         let settings_changed = self.settings.gif_import_paths.iter().any(|path| {
             path == &pack_path || path.parent().is_some_and(|parent| parent == pack_path)
         });
@@ -785,12 +798,7 @@ impl SymbolisApp {
             self.status = Some(format!("Settings save error: {err}"));
             return;
         }
-        if let Err(err) = self.save_favorite_media_ids() {
-            self.status = Some(format!("Favorites save error: {err}"));
-            return;
-        }
-        if let Err(err) = self.save_recent_media() {
-            self.status = Some(format!("Recent media save error: {err}"));
+        if !self.save_media_metadata() {
             return;
         }
 
@@ -802,26 +810,7 @@ impl SymbolisApp {
         self.content_mode = ContentMode::Stickers;
         self.media_view = MediaView::Library;
 
-        let mut status = format!(
-            "Deleted sticker pack {pack_label}: {deleted} file{}",
-            plural_suffix(deleted)
-        );
-        if missing > 0 {
-            status.push_str(&format!(
-                "; removed {missing} missing file{}",
-                plural_suffix(missing)
-            ));
-        }
-        if !errors.is_empty() {
-            status.push_str(&format!(
-                "; {} delete error{}",
-                errors.len(),
-                plural_suffix(errors.len())
-            ));
-        }
-        if let Some(first_error) = errors.first() {
-            status.push_str(&format!(": {first_error}"));
-        }
+        let status = deletion.status(format!("Deleted sticker pack {pack_label}"));
         self.log_dev(format!("delete sticker pack: {status}"));
         self.queue_media_scan(format!("{status}; reindexing sticker library..."));
     }
@@ -857,7 +846,7 @@ impl SymbolisApp {
                 continue;
             }
 
-            imported_content_mode = Some(content_mode_for_media_path(&path));
+            imported_content_mode = Some(ContentMode::for_media_path(&path));
 
             if mode == MediaImportMode::StoreFiles && path.is_file() {
                 if self.queue_media_job(MediaJobRequest::StoredImport {
@@ -1144,7 +1133,7 @@ impl SymbolisApp {
     }
 
     pub(crate) fn content_mode_enabled(&self, mode: ContentMode) -> bool {
-        content_mode_enabled(mode, &self.settings.features)
+        mode.enabled(&self.settings.features)
     }
 
     pub(crate) fn selected_media_count(&self) -> usize {
@@ -1159,21 +1148,6 @@ impl SymbolisApp {
         if !self.selected_media_ids.insert(item.id.clone()) {
             self.selected_media_ids.remove(&item.id);
         }
-    }
-
-    pub(crate) fn select_filtered_media(&mut self) {
-        let ids = self
-            .filtered_media_sources()
-            .into_iter()
-            .filter_map(|source| self.media_item_from_source(source))
-            .map(|item| item.id)
-            .collect::<Vec<_>>();
-        self.selected_media_ids.extend(ids);
-        self.status = Some(format!(
-            "Selected {} media item{}",
-            self.selected_media_ids.len(),
-            plural_suffix(self.selected_media_ids.len())
-        ));
     }
 
     pub(crate) fn clear_media_selection(&mut self) {
@@ -1235,51 +1209,18 @@ impl SymbolisApp {
             return;
         }
 
-        let mut deleted = 0;
-        let mut missing = 0;
-        let mut errors = Vec::new();
-        for item in &items {
-            match std::fs::remove_file(&item.path) {
-                Ok(()) => deleted += 1,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => missing += 1,
-                Err(err) => errors.push(format!("{}: {err}", item.title)),
-            }
-        }
+        let deletion = MediaDeletionSummary::delete_files(&items);
 
         self.selected_media_ids.clear();
         self.favorite_media_ids
             .retain(|id| !selected_ids.contains(id));
         self.recent_media
             .retain(|item| !selected_ids.contains(&item.id));
-        if let Err(err) = self.save_favorite_media_ids() {
-            self.status = Some(format!("Favorites save error: {err}"));
-            return;
-        }
-        if let Err(err) = self.save_recent_media() {
-            self.status = Some(format!("Recent media save error: {err}"));
+        if !self.save_media_metadata() {
             return;
         }
 
-        let mut status = format!(
-            "Deleted {deleted} selected media file{}",
-            plural_suffix(deleted)
-        );
-        if missing > 0 {
-            status.push_str(&format!(
-                "; removed {missing} missing file{}",
-                plural_suffix(missing)
-            ));
-        }
-        if !errors.is_empty() {
-            status.push_str(&format!(
-                "; {} delete error{}",
-                errors.len(),
-                plural_suffix(errors.len())
-            ));
-        }
-        if let Some(first_error) = errors.first() {
-            status.push_str(&format!(": {first_error}"));
-        }
+        let status = deletion.status("Deleted selected media");
         self.queue_media_scan(format!("{status}; reindexing media library..."));
     }
 
@@ -1467,6 +1408,19 @@ impl SymbolisApp {
         )
     }
 
+    fn save_media_metadata(&mut self) -> bool {
+        if let Err(err) = self.save_favorite_media_ids() {
+            self.status = Some(format!("Favorites save error: {err}"));
+            return false;
+        }
+        if let Err(err) = self.save_recent_media() {
+            self.status = Some(format!("Recent media save error: {err}"));
+            return false;
+        }
+
+        true
+    }
+
     fn log_dev(&mut self, message: impl Into<String>) {
         if self.dev_log.len() >= DEV_LOG_LIMIT {
             self.dev_log.pop_front();
@@ -1506,9 +1460,7 @@ impl SymbolisApp {
             generation,
             paths: media_scan_paths(&self.settings.gif_import_paths),
             index_path: self.media_index_path.clone(),
-            include_gifs: self.settings.features.gifs,
-            include_stickers: self.settings.features.stickers,
-            deduplicate: true,
+            options: MediaScanOptions::from_features(&self.settings.features),
         };
         self.active_media_scans += 1;
         if self.media_scan_tx.send(request).is_ok() {
@@ -1592,15 +1544,12 @@ impl SymbolisApp {
                 self.ensure_content_mode_enabled();
             }
             IpcCommand::ShowSymbols => {
-                self.show_window(ctx);
                 self.activate_global_hotkey(HotkeyAction::Symbols, ctx);
             }
             IpcCommand::ShowStickers => {
-                self.show_window(ctx);
                 self.activate_global_hotkey(HotkeyAction::Stickers, ctx);
             }
             IpcCommand::ShowGifs => {
-                self.show_window(ctx);
                 self.activate_global_hotkey(HotkeyAction::Gifs, ctx);
             }
             IpcCommand::Quit => {
@@ -1648,32 +1597,34 @@ impl SymbolisApp {
                 self.ensure_content_mode_enabled();
             }
             HotkeyAction::Symbols => {
-                if self.settings.features.symbols {
-                    self.content_mode = ContentMode::Symbols;
-                    self.selected_tab = Tab::Category(crate::data::Category::Emoji);
-                } else {
-                    self.content_mode = first_enabled_content_mode(&self.settings.features);
-                }
+                self.activate_content_mode(ContentMode::Symbols);
             }
             HotkeyAction::Stickers => {
-                if self.settings.features.stickers {
-                    self.content_mode = ContentMode::Stickers;
-                    self.media_view = MediaView::Library;
-                } else {
-                    self.content_mode = first_enabled_content_mode(&self.settings.features);
-                }
+                self.activate_content_mode(ContentMode::Stickers);
             }
             HotkeyAction::Gifs => {
-                if self.settings.features.gifs {
-                    self.content_mode = ContentMode::Gifs;
-                    self.media_view = MediaView::Library;
-                } else {
-                    self.content_mode = first_enabled_content_mode(&self.settings.features);
-                }
+                self.activate_content_mode(ContentMode::Gifs);
             }
         }
 
         self.status = Some(format!("Opened via {}", action.label()));
+    }
+
+    fn activate_content_mode(&mut self, mode: ContentMode) {
+        self.content_mode = if mode.enabled(&self.settings.features) {
+            mode
+        } else {
+            ContentMode::first_enabled(&self.settings.features)
+        };
+
+        match self.content_mode {
+            ContentMode::Symbols => {
+                self.selected_tab = Tab::Category(crate::data::Category::Emoji);
+            }
+            ContentMode::Stickers | ContentMode::Gifs => {
+                self.media_view = MediaView::Library;
+            }
+        }
     }
 
     fn handle_close_request(&mut self, ctx: &Context) {
@@ -1735,7 +1686,7 @@ impl SymbolisApp {
         match result {
             MediaJobResult::StoredImport { original, result } => match result {
                 Ok(path) => {
-                    self.content_mode = content_mode_for_media_path(&path);
+                    self.content_mode = ContentMode::for_media_path(&path);
                     self.media_view = MediaView::Library;
                     self.queue_media_scan(format!(
                         "Stored optimized media: {}; indexing media library...",
@@ -1807,7 +1758,7 @@ impl SymbolisApp {
             self.settings.gif_import_paths.push(path.clone());
             self.save_settings();
         }
-        self.content_mode = content_mode_for_media_path(&path);
+        self.content_mode = ContentMode::for_media_path(&path);
         self.media_view = MediaView::Library;
         self.queue_media_scan(format!(
             "Imported original: {}; storage warning: {err}; indexing media library...",
@@ -1920,284 +1871,12 @@ pub(crate) fn has_hovered_files(ctx: &Context) -> bool {
     ctx.input(|input| !input.raw.hovered_files.is_empty())
 }
 
-fn spawn_media_worker() -> (Sender<MediaJobRequest>, Receiver<MediaJobResult>) {
-    let (job_tx, job_rx) = mpsc::channel::<MediaJobRequest>();
-    let (result_tx, result_rx) = mpsc::channel::<MediaJobResult>();
-
-    thread::spawn(move || {
-        while let Ok(job) = job_rx.recv() {
-            match job {
-                MediaJobRequest::ImportTelegramStickerSet { set_name, token } => {
-                    let progress_tx = result_tx.clone();
-                    let progress_set_name = set_name.clone();
-                    let result =
-                        import_telegram_sticker_set_with_progress(&set_name, &token, |message| {
-                            let _ =
-                                progress_tx.send(MediaJobResult::TelegramStickerImportProgress {
-                                    set_name: progress_set_name.clone(),
-                                    message,
-                                });
-                        })
-                        .map_err(|err| err.to_string());
-                    if result_tx
-                        .send(MediaJobResult::TelegramStickerImport { set_name, result })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                job => {
-                    if result_tx.send(run_media_job(job)).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    (job_tx, result_rx)
-}
-
-fn spawn_media_scan_worker() -> (Sender<MediaScanRequest>, Receiver<MediaScanResult>) {
-    let (scan_tx, scan_rx) = mpsc::channel::<MediaScanRequest>();
-    let (result_tx, result_rx) = mpsc::channel::<MediaScanResult>();
-
-    thread::spawn(move || {
-        while let Ok(request) = scan_rx.recv() {
-            if result_tx.send(run_media_scan(request)).is_err() {
-                break;
-            }
-        }
-    });
-
-    (scan_tx, result_rx)
-}
-
-fn spawn_media_watch_worker() -> (Sender<MediaWatchRequest>, Receiver<MediaWatchResult>) {
-    let (request_tx, request_rx) = mpsc::channel::<MediaWatchRequest>();
-    let (result_tx, result_rx) = mpsc::channel::<MediaWatchResult>();
-
-    thread::spawn(move || run_media_watch_worker(request_rx, result_tx));
-
-    (request_tx, result_rx)
-}
-
-fn run_media_watch_worker(
-    request_rx: Receiver<MediaWatchRequest>,
-    result_tx: Sender<MediaWatchResult>,
-) {
-    use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-
-    let (event_tx, event_rx) = mpsc::channel::<notify::Result<notify::Event>>();
-    let mut watcher: Option<RecommendedWatcher> = None;
-
-    loop {
-        match request_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(MediaWatchRequest::Watch { paths }) => {
-                watcher = RecommendedWatcher::new(
-                    {
-                        let event_tx = event_tx.clone();
-                        move |result| {
-                            let _ = event_tx.send(result);
-                        }
-                    },
-                    Config::default(),
-                )
-                .ok();
-
-                if let Some(watcher) = watcher.as_mut() {
-                    for target in media_watch_targets(&paths) {
-                        let mode = if target.is_dir() {
-                            RecursiveMode::Recursive
-                        } else {
-                            RecursiveMode::NonRecursive
-                        };
-                        let _ = watcher.watch(&target, mode);
-                    }
-                }
-            }
-            Ok(MediaWatchRequest::Stop) => {
-                watcher = None;
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-        let _watcher_is_active = watcher.is_some();
-
-        let mut changed = false;
-        while let Ok(event) = event_rx.try_recv() {
-            let Ok(event) = event else {
-                continue;
-            };
-            if matches!(
-                event.kind,
-                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) | EventKind::Any
-            ) {
-                changed = true;
-            }
-        }
-
-        if changed {
-            thread::sleep(Duration::from_millis(500));
-            while event_rx.try_recv().is_ok() {}
-            if result_tx.send(MediaWatchResult::Changed).is_err() {
-                break;
-            }
-        }
-    }
-}
-
-fn run_media_job(job: MediaJobRequest) -> MediaJobResult {
-    match job {
-        MediaJobRequest::StoredImport { original } => {
-            let result = store_media_file_for_library(&original).map_err(|err| err.to_string());
-            MediaJobResult::StoredImport { original, result }
-        }
-        MediaJobRequest::OptimizedCopy { item, title } => {
-            let result = save_media_as_webm(&item).map_err(|err| err.to_string());
-            MediaJobResult::OptimizedCopy { title, result }
-        }
-        MediaJobRequest::ExportForCopy { item } => {
-            let result = export_media_for_transfer(&item).map_err(|err| err.to_string());
-            MediaJobResult::ExportForCopy { item, result }
-        }
-        MediaJobRequest::ExportForDrag { item } => {
-            let result = export_media_for_transfer(&item).map_err(|err| err.to_string());
-            MediaJobResult::ExportForDrag { item, result }
-        }
-        MediaJobRequest::ImportTelegramStickerSet { set_name, token } => {
-            let result =
-                import_telegram_sticker_set(&set_name, &token).map_err(|err| err.to_string());
-            MediaJobResult::TelegramStickerImport { set_name, result }
-        }
-    }
-}
-
-fn run_media_scan(request: MediaScanRequest) -> MediaScanResult {
-    match request {
-        MediaScanRequest::Scan {
-            generation,
-            paths,
-            index_path,
-            include_gifs,
-            include_stickers,
-            deduplicate,
-        } => {
-            let mut items = scan_media_library(&paths, deduplicate);
-            items.retain(|item| match item.kind {
-                MediaKind::Gif => include_gifs,
-                MediaKind::Sticker => include_stickers,
-            });
-            let index_save_error = save_media_index(index_path.as_deref(), &items)
-                .err()
-                .map(|err| err.to_string());
-            MediaScanResult::Complete {
-                generation,
-                items,
-                index_save_error,
-            }
-        }
-    }
-}
-
-fn media_job_request_label(job: &MediaJobRequest) -> String {
-    match job {
-        MediaJobRequest::StoredImport { original } => {
-            format!("store import {}", media_path_label(original))
-        }
-        MediaJobRequest::OptimizedCopy { title, .. } => {
-            format!("save optimized WebM for {title}")
-        }
-        MediaJobRequest::ExportForCopy { item } => {
-            format!("export for clipboard {}", item.title)
-        }
-        MediaJobRequest::ExportForDrag { item } => {
-            format!("export for drag {}", item.title)
-        }
-        MediaJobRequest::ImportTelegramStickerSet { set_name, .. } => {
-            format!("import Telegram stickers {set_name}")
-        }
-    }
-}
-
-fn media_job_result_label(result: &MediaJobResult) -> String {
-    match result {
-        MediaJobResult::StoredImport { original, result } => match result {
-            Ok(path) => format!(
-                "job complete: stored {} -> {}",
-                media_path_label(original),
-                media_path_label(path)
-            ),
-            Err(err) => format!("job failed: store {}: {err}", media_path_label(original)),
-        },
-        MediaJobResult::OptimizedCopy { title, result } => match result {
-            Ok(path) => format!(
-                "job complete: optimized {title} -> {}",
-                media_path_label(path)
-            ),
-            Err(err) => format!("job failed: optimize {title}: {err}"),
-        },
-        MediaJobResult::ExportForCopy { item, result } => match result {
-            Ok(path) => format!(
-                "job complete: exported {} for clipboard -> {}",
-                item.title,
-                media_path_label(path)
-            ),
-            Err(err) => format!("job failed: export {} for clipboard: {err}", item.title),
-        },
-        MediaJobResult::ExportForDrag { item, result } => match result {
-            Ok(path) => format!(
-                "job complete: exported {} for drag -> {}",
-                item.title,
-                media_path_label(path)
-            ),
-            Err(err) => format!("job failed: export {} for drag: {err}", item.title),
-        },
-        MediaJobResult::TelegramStickerImport { set_name, result } => match result {
-            Ok(summary) => format!(
-                "job complete: Telegram {set_name}; imported {}, skipped animated {}, unsupported {}, failed {}",
-                summary.imported,
-                summary.skipped_animated,
-                summary.skipped_unsupported,
-                summary.failed
-            ),
-            Err(err) => format!("job failed: Telegram {set_name}: {err}"),
-        },
-        MediaJobResult::TelegramStickerImportProgress { set_name, message } => {
-            format!("job progress: Telegram {set_name}: {message}")
-        }
-    }
-}
-
-fn media_job_result_is_terminal(result: &MediaJobResult) -> bool {
-    !matches!(result, MediaJobResult::TelegramStickerImportProgress { .. })
-}
-
 fn plural_suffix(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
 }
 
 fn media_transfer_requires_export(item: &MediaItem) -> bool {
     matches!(item.format, MediaFormat::Mp4 | MediaFormat::Webm)
-}
-
-fn content_mode_for_media_kind(kind: MediaKind) -> ContentMode {
-    match kind {
-        MediaKind::Gif => ContentMode::Gifs,
-        MediaKind::Sticker => ContentMode::Stickers,
-    }
-}
-
-fn content_mode_for_media_path(path: &Path) -> ContentMode {
-    match path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("png" | "webp") => ContentMode::Stickers,
-        _ => ContentMode::Gifs,
-    }
 }
 
 fn sticker_pack_id(item: &MediaItem) -> Option<String> {
@@ -2213,13 +1892,6 @@ fn sticker_pack_label(id: &str) -> String {
         .map(|name| name.replace(['_', '-'], " "))
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| "Loose stickers".to_owned())
-}
-
-fn media_path_label(path: &Path) -> String {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn transfer_mime_for_path<'a>(path: &std::path::Path, item: &'a MediaItem) -> &'a str {
@@ -2256,56 +1928,8 @@ fn media_scan_paths(import_paths: &[PathBuf]) -> Vec<PathBuf> {
     paths
 }
 
-fn media_watch_targets(paths: &[PathBuf]) -> Vec<PathBuf> {
-    let mut seen = HashSet::new();
-    let mut targets = Vec::new();
-
-    for path in paths {
-        let target = if path.is_file() {
-            path.parent().map(Path::to_path_buf)
-        } else if path.exists() {
-            Some(path.clone())
-        } else {
-            path.parent()
-                .filter(|parent| parent.exists())
-                .map(Path::to_path_buf)
-        };
-
-        let Some(target) = target else {
-            continue;
-        };
-        let target = fs::canonicalize(&target).unwrap_or(target);
-        if seen.insert(target.clone()) {
-            targets.push(target);
-        }
-    }
-
-    targets
-}
-
-fn first_enabled_content_mode(features: &FeatureSettings) -> ContentMode {
-    if features.symbols {
-        ContentMode::Symbols
-    } else if features.stickers {
-        ContentMode::Stickers
-    } else {
-        ContentMode::Gifs
-    }
-}
-
-fn content_mode_enabled(mode: ContentMode, features: &FeatureSettings) -> bool {
-    match mode {
-        ContentMode::Symbols => features.symbols,
-        ContentMode::Stickers => features.stickers,
-        ContentMode::Gifs => features.gifs,
-    }
-}
-
 fn media_item_enabled(item: &MediaItem, features: &FeatureSettings) -> bool {
-    match item.kind {
-        MediaKind::Gif => features.gifs,
-        MediaKind::Sticker => features.stickers,
-    }
+    ContentMode::for_media_kind(item.kind).enabled(features)
 }
 
 fn shell_quote(path: &Path) -> String {

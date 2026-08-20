@@ -2,7 +2,7 @@ use std::{
     fs, io,
     io::{Read, Write},
     os::unix::net::{UnixListener, UnixStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     thread,
     time::Duration,
@@ -21,6 +21,15 @@ pub(crate) enum IpcCommand {
 }
 
 impl IpcCommand {
+    const ALL: [Self; 6] = [
+        Self::Toggle,
+        Self::ShowMain,
+        Self::ShowSymbols,
+        Self::ShowStickers,
+        Self::ShowGifs,
+        Self::Quit,
+    ];
+
     pub(crate) fn arg(self) -> &'static str {
         match self {
             IpcCommand::Toggle => "--toggle",
@@ -30,6 +39,13 @@ impl IpcCommand {
             IpcCommand::ShowGifs => "--show-gifs",
             IpcCommand::Quit => "--quit",
         }
+    }
+
+    pub(crate) fn from_arg(value: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|command| command.arg() == value)
     }
 
     fn wire(self) -> &'static str {
@@ -44,15 +60,11 @@ impl IpcCommand {
     }
 
     fn from_wire(value: &str) -> Option<Self> {
-        match value.trim() {
-            "toggle" => Some(Self::Toggle),
-            "show-main" => Some(Self::ShowMain),
-            "show-symbols" => Some(Self::ShowSymbols),
-            "show-stickers" => Some(Self::ShowStickers),
-            "show-gifs" => Some(Self::ShowGifs),
-            "quit" => Some(Self::Quit),
-            _ => None,
-        }
+        let value = value.trim();
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|command| command.wire() == value)
     }
 }
 
@@ -113,11 +125,32 @@ pub(crate) fn socket_path() -> io::Result<PathBuf> {
     Ok(runtime_dir.join("symbolis.sock"))
 }
 
-fn remove_stale_socket(path: &PathBuf) {
+fn remove_stale_socket(path: &Path) {
     if !path.exists() {
         return;
     }
     if UnixStream::connect(path).is_err() {
         let _ = fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_cli_args_to_commands() {
+        for command in IpcCommand::ALL {
+            assert_eq!(IpcCommand::from_arg(command.arg()), Some(command));
+        }
+        assert_eq!(IpcCommand::from_arg("--unknown"), None);
+    }
+
+    #[test]
+    fn maps_wire_values_to_commands() {
+        for command in IpcCommand::ALL {
+            assert_eq!(IpcCommand::from_wire(command.wire()), Some(command));
+        }
+        assert_eq!(IpcCommand::from_wire("unknown"), None);
     }
 }

@@ -98,6 +98,15 @@ impl HotkeyAction {
             HotkeyAction::Gifs => "GIFs",
         }
     }
+
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            HotkeyAction::Main => "main",
+            HotkeyAction::Symbols => "symbols",
+            HotkeyAction::Stickers => "stickers",
+            HotkeyAction::Gifs => "gifs",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -223,6 +232,10 @@ impl Default for FeatureSettings {
 impl FeatureSettings {
     pub(crate) fn enabled_content_count(&self) -> usize {
         usize::from(self.symbols) + usize::from(self.stickers) + usize::from(self.gifs)
+    }
+
+    pub(crate) fn media_enabled(&self) -> bool {
+        self.stickers || self.gifs
     }
 
     pub(crate) fn ensure_any_content_enabled(&mut self) {

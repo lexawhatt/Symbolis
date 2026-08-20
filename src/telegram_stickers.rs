@@ -159,13 +159,6 @@ pub(crate) fn sticker_set_name_from_input(input: &str) -> Option<String> {
     is_valid_sticker_set_name(&name).then_some(name)
 }
 
-pub(crate) fn import_telegram_sticker_set(
-    set_name: &str,
-    token: &str,
-) -> Result<TelegramStickerImportSummary, TelegramStickerImportError> {
-    import_telegram_sticker_set_with_progress(set_name, token, |_| {})
-}
-
 pub(crate) fn import_telegram_sticker_set_with_progress(
     set_name: &str,
     token: &str,

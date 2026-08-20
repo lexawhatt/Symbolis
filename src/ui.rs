@@ -940,15 +940,6 @@ impl SymbolisApp {
                     self.add_selected_media_to_favorites();
                 }
                 ui.add_space(if modern { 12.0 } else { 10.0 });
-            } else {
-                if ui
-                    .button(RichText::new("Select all").color(self.settings.palette.text.color()))
-                    .on_hover_text("Select all media visible in the current view")
-                    .clicked()
-                {
-                    self.select_filtered_media();
-                }
-                ui.add_space(if modern { 12.0 } else { 10.0 });
             }
         }
 
@@ -1496,10 +1487,31 @@ impl SymbolisApp {
                                     .on_hover_text("Index and show GIF/video media")
                                     .changed();
                             });
+                            ui.add_space(8.0);
+                            ui.horizontal_wrapped(|ui| {
+                                features_changed |= ui
+                                    .checkbox(
+                                        &mut self.settings.features.media_watcher,
+                                        "Watch media folders",
+                                    )
+                                    .on_hover_text(
+                                        "Automatically reindex media when watched folders change",
+                                    )
+                                    .changed();
+                                features_changed |= ui
+                                    .checkbox(
+                                        &mut self.settings.features.deduplicate_media,
+                                        "Deduplicate media",
+                                    )
+                                    .on_hover_text(
+                                        "Collapse identical files during media library scans",
+                                    )
+                                    .changed();
+                            });
                         });
 
                         ui.add_space(12.0);
-                        settings_panel(ui, "Global Hotkeys", self.settings.palette, |ui| {
+                        settings_panel(ui, "Global Hotkey", self.settings.palette, |ui| {
                             hotkeys_changed |= ui
                                 .checkbox(
                                     &mut self.settings.hotkeys.enabled,
@@ -1508,7 +1520,9 @@ impl SymbolisApp {
                                 .on_hover_text("Optional X11-oriented backend; system launcher shortcut below is preferred on Wayland")
                                 .changed();
                             ui.add_space(8.0);
-                            hotkeys_changed |= draw_hotkey_row(self, ui, ctx, HotkeyAction::Main);
+                            for action in HotkeyAction::CHOICES {
+                                hotkeys_changed |= draw_hotkey_row(self, ui, ctx, action);
+                            }
 
                             ui.label(
                                 RichText::new(self.global_hotkey_status())
@@ -2023,21 +2037,18 @@ fn draw_hotkey_row(
     let palette = app.settings.palette;
     let capturing = app.capture_hotkey_action == Some(action);
 
-    if capturing && let Some((key, shift, control, alt)) = capture_hotkey_key(ctx) {
+    if capturing && let Some(key) = capture_hotkey_key(ctx) {
         let binding = app
             .settings
             .hotkeys
             .binding_mut(action)
             .get_or_insert_with(|| HotkeyBinding::new(""));
         binding.key = key;
-        binding.shift = shift;
-        binding.control = control;
-        binding.alt = alt;
         app.capture_hotkey_action = None;
         changed = true;
     }
 
-    egui::Grid::new("global_hotkey_binding_grid")
+    egui::Grid::new(format!("global_hotkey_binding_grid_{}", action.id()))
         .num_columns(3)
         .spacing([16.0, 8.0])
         .show(ui, |ui| {
@@ -2126,18 +2137,13 @@ fn draw_hotkey_row(
     changed
 }
 
-fn capture_hotkey_key(ctx: &Context) -> Option<(String, bool, bool, bool)> {
+fn capture_hotkey_key(ctx: &Context) -> Option<String> {
     ctx.input(|input| {
         for key in egui::Key::ALL {
             if input.key_pressed(*key)
                 && let Some(code) = hotkey_code_for_egui_key(*key)
             {
-                return Some((
-                    code.to_owned(),
-                    input.modifiers.shift,
-                    input.modifiers.ctrl,
-                    input.modifiers.alt,
-                ));
+                return Some(code.to_owned());
             }
         }
         None
@@ -2557,12 +2563,13 @@ fn draw_media_grid(ui: &mut egui::Ui, app: &mut SymbolisApp, filtered: &[MediaIt
                         let response = draw_media_tile(ui, app, &item, tile_width);
                         if response.clicked() {
                             let pointer_pos = response.interact_pointer_pos();
+                            let bulk_selecting = ui.input(|input| input.modifiers.shift);
                             let select_clicked = pointer_pos
                                 .is_some_and(|pos| media_select_rect(response.rect).contains(pos));
                             let favorite_clicked = pointer_pos.is_some_and(|pos| {
                                 media_favorite_rect(response.rect).contains(pos)
                             });
-                            if select_clicked {
+                            if select_clicked || bulk_selecting {
                                 app.toggle_media_selected(&item);
                             } else if favorite_clicked {
                                 app.toggle_media_favorite(&item);
@@ -2664,10 +2671,21 @@ fn draw_media_tile(
     let palette = app.settings.palette;
     let chrome = chrome(app.settings.interface_mode);
     let modern = app.settings.interface_mode.is_modern();
+    let selected = app.is_media_selected(item);
     let hover_t = ui.ctx().animate_bool(response.id, response.hovered());
     let draw_rect = rect.expand(hover_t * if modern { 2.0 } else { 3.0 });
-    let fill = blend_color(palette.tile.color(), palette.tile_hover.color(), hover_t);
-    let stroke = if response.hovered() {
+    let base_fill = if selected {
+        blend_color(palette.tile.color(), palette.accent.color(), 0.22)
+    } else {
+        palette.tile.color()
+    };
+    let fill = blend_color(base_fill, palette.tile_hover.color(), hover_t * 0.72);
+    let stroke = if selected {
+        Stroke::new(
+            if response.hovered() { 2.0 } else { 1.5 },
+            palette.accent.color(),
+        )
+    } else if response.hovered() {
         Stroke::new(1.0, palette.accent.color())
     } else if modern {
         Stroke::new(
@@ -2684,21 +2702,39 @@ fn draw_media_tile(
         fill,
         stroke,
     );
+    if selected {
+        ui.painter().rect_filled(
+            draw_rect.shrink(4.0),
+            Rounding::same((chrome.tile_rounding - 2.0).max(3.0)),
+            fade_color(palette.accent.color(), 0.10),
+        );
+    }
 
     let select_rect = media_select_rect(rect);
     ui.painter().rect(
         select_rect,
         Rounding::same(4.0),
-        fade_color(palette.bg.color(), 0.72),
-        Stroke::new(1.0, palette.muted.color()),
+        if selected {
+            palette.accent.color()
+        } else {
+            fade_color(palette.bg.color(), 0.72)
+        },
+        Stroke::new(
+            1.0,
+            if selected {
+                palette.accent.color()
+            } else {
+                palette.muted.color()
+            },
+        ),
     );
-    if app.is_media_selected(item) {
+    if selected {
         ui.painter().text(
             select_rect.center(),
             Align2::CENTER_CENTER,
             "✓",
             FontId::proportional(15.0),
-            palette.accent.color(),
+            palette.bg.color(),
         );
     }
 
@@ -2712,12 +2748,17 @@ fn draw_media_tile(
         blend_color(palette.panel_dark.color(), palette.tile.color(), 0.28),
         Stroke::new(
             1.0,
-            blend_color(palette.panel.color(), palette.tile.color(), 0.45),
+            if selected {
+                blend_color(palette.accent.color(), palette.tile.color(), 0.35)
+            } else {
+                blend_color(palette.panel.color(), palette.tile.color(), 0.45)
+            },
         ),
     );
     if let Some(texture) = app.media_preview_cache.texture(ui.ctx(), item) {
         let image_rect = fit_centered(preview_rect.shrink(3.0), texture.size_vec2());
-        ui.painter().image(
+        let image_rect = scale_rect_centered(image_rect, 1.0 + hover_t * 0.08);
+        ui.painter().with_clip_rect(preview_rect).image(
             texture.id(),
             image_rect,
             Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
@@ -2928,6 +2969,10 @@ fn fit_centered(bounds: Rect, size: egui::Vec2) -> Rect {
     let scale = (max_size.x / size.x).min(max_size.y / size.y).min(1.0);
     let size = size * scale;
     Rect::from_center_size(bounds.center(), size)
+}
+
+fn scale_rect_centered(rect: Rect, scale: f32) -> Rect {
+    Rect::from_center_size(rect.center(), rect.size() * scale)
 }
 
 fn display_symbol(entry: &Entry, width: f32) -> String {
