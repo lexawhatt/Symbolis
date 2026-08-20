@@ -9,6 +9,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::persistence::write_json_atomic;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub(crate) enum MediaKind {
     Gif,
@@ -189,7 +191,7 @@ pub(crate) fn load_recent_media(path: Option<&Path>) -> Vec<MediaItem> {
 }
 
 pub(crate) fn save_recent_media(path: Option<&Path>, items: &[MediaItem]) -> io::Result<()> {
-    write_json(path, items)
+    write_json_atomic(path, items)
 }
 
 pub(crate) fn load_favorite_media_ids(path: Option<&Path>) -> Vec<String> {
@@ -203,11 +205,11 @@ pub(crate) fn load_favorite_media_ids(path: Option<&Path>) -> Vec<String> {
 }
 
 pub(crate) fn save_favorite_media_ids(path: Option<&Path>, ids: &[String]) -> io::Result<()> {
-    write_json(path, ids)
+    write_json_atomic(path, ids)
 }
 
 pub(crate) fn save_media_index(path: Option<&Path>, items: &[MediaItem]) -> io::Result<()> {
-    write_json(path, items)
+    write_json_atomic(path, items)
 }
 
 pub(crate) fn load_media_index(path: Option<&Path>) -> Vec<MediaItem> {
@@ -594,19 +596,6 @@ fn stable_media_id(path: &Path) -> String {
         hash = hash.wrapping_mul(1099511628211);
     }
     format!("{hash:016x}")
-}
-
-fn write_json<T: Serialize + ?Sized>(path: Option<&Path>, value: &T) -> io::Result<()> {
-    let Some(path) = path else {
-        return Ok(());
-    };
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let json = serde_json::to_string_pretty(value)?;
-    fs::write(path, json)
 }
 
 #[derive(Debug)]

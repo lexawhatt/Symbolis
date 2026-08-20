@@ -30,6 +30,7 @@ use crate::{
         media_job_result_label, media_path_label, spawn_media_scan_worker,
         spawn_media_watch_worker, spawn_media_worker,
     },
+    persistence::write_json_atomic,
     preflight::{PreflightReport, StartupWarning},
     settings::{
         FeatureSettings, HotkeyAction, UiSettings, configure_fonts, configure_style, load_settings,
@@ -1451,17 +1452,8 @@ impl SymbolisApp {
     }
 
     fn save_recent(&self) -> io::Result<()> {
-        let Some(path) = &self.recent_path else {
-            return Ok(());
-        };
-
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
         let recent: Vec<StoredEntry> = self.recent.iter().map(StoredEntry::from).collect();
-        let json = serde_json::to_string_pretty(&recent)?;
-        std::fs::write(path, json)
+        write_json_atomic(self.recent_path.as_deref(), &recent)
     }
 
     fn save_recent_media(&self) -> io::Result<()> {

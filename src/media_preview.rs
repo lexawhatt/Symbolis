@@ -11,13 +11,15 @@ use std::{
 
 use eframe::egui::{ColorImage, Context, TextureHandle, TextureOptions};
 
-use crate::media_library::{MediaFormat, MediaItem, MediaKind};
+use crate::{
+    media_library::{MediaFormat, MediaItem, MediaKind},
+    settings::{MEDIA_PREVIEW_FRAMERATE_MAX_FPS, MEDIA_PREVIEW_FRAMERATE_MIN_FPS},
+};
 
 const STATIC_TEXTURE_CACHE_LIMIT: usize = 256;
 const STATIC_TEXTURE_CACHE_LIMIT_LOW_MEMORY: usize = 64;
 const ANIMATED_TEXTURE_CACHE_LIMIT: usize = 2;
 const ANIMATED_TEXTURE_CACHE_LIMIT_LOW_MEMORY: usize = 1;
-const ANIMATED_PREVIEW_FPS: usize = 6;
 const ANIMATED_PREVIEW_MAX_FRAMES: usize = 12;
 
 enum CachedMediaPreview {
@@ -57,6 +59,7 @@ enum PreviewJobRequest {
         key: String,
         input: PathBuf,
         output_dir: PathBuf,
+        framerate_fps: u32,
     },
 }
 
@@ -116,6 +119,7 @@ impl MediaPreviewCache {
         item: &MediaItem,
         now_seconds: f64,
         low_memory: bool,
+        framerate_fps: u32,
     ) -> Option<&TextureHandle> {
         if !media_can_animate(item) {
             return None;
@@ -123,14 +127,15 @@ impl MediaPreviewCache {
 
         self.drain_completed(ctx);
 
-        let key = animated_preview_cache_key(item, low_memory);
+        let framerate_fps = normalized_animation_fps(framerate_fps);
+        let key = animated_preview_cache_key(item, low_memory, framerate_fps);
         if !self.animated_textures.contains_key(&key) {
             if let Some(textures) = self.load_cached_animation(ctx, &key) {
                 self.animated_textures
                     .insert(key.clone(), CachedAnimatedMediaPreview::Ready(textures));
                 self.remember_animated_texture_key(&key, low_memory);
             } else {
-                self.queue_animation_job(&key, item);
+                self.queue_animation_job(&key, item, framerate_fps);
             }
         }
 
@@ -140,10 +145,8 @@ impl MediaPreviewCache {
 
         match self.animated_textures.get(&key) {
             Some(CachedAnimatedMediaPreview::Ready(frames)) if !frames.is_empty() => {
-                ctx.request_repaint_after(Duration::from_millis(
-                    (1000 / ANIMATED_PREVIEW_FPS) as u64,
-                ));
-                let index = ((now_seconds * ANIMATED_PREVIEW_FPS as f64) as usize) % frames.len();
+                ctx.request_repaint_after(Duration::from_millis(1000 / u64::from(framerate_fps)));
+                let index = ((now_seconds * f64::from(framerate_fps)) as usize) % frames.len();
                 frames.get(index)
             }
             _ => None,
@@ -269,7 +272,7 @@ impl MediaPreviewCache {
         }
     }
 
-    fn queue_animation_job(&mut self, key: &str, item: &MediaItem) {
+    fn queue_animation_job(&mut self, key: &str, item: &MediaItem, framerate_fps: u32) {
         if self.animated_in_flight.contains(key) {
             return;
         }
@@ -287,6 +290,7 @@ impl MediaPreviewCache {
             key: key.clone(),
             input,
             output_dir,
+            framerate_fps,
         };
         self.ensure_worker();
         let sent = self
@@ -374,8 +378,9 @@ fn run_preview_job(job: PreviewJobRequest) -> PreviewJobResult {
             key,
             input,
             output_dir,
+            framerate_fps,
         } => {
-            let paths = render_media_animation(&input, &output_dir);
+            let paths = render_media_animation(&input, &output_dir, framerate_fps);
             if paths.is_empty() {
                 let _ = fs::remove_dir_all(output_dir);
                 PreviewJobResult::AnimationFailed { key }
@@ -412,13 +417,14 @@ fn render_media_thumbnail(input: &Path, output: &Path, low_memory: bool) -> bool
         .is_ok_and(|status| status.success())
 }
 
-fn render_media_animation(input: &Path, output_dir: &Path) -> Vec<PathBuf> {
+fn render_media_animation(input: &Path, output_dir: &Path, framerate_fps: u32) -> Vec<PathBuf> {
     let _ = fs::remove_dir_all(output_dir);
     if fs::create_dir_all(output_dir).is_err() {
         return Vec::new();
     }
 
     let output_pattern = output_dir.join("frame_%03d.png");
+    let framerate_fps = normalized_animation_fps(framerate_fps);
     let status = Command::new("ffmpeg")
         .arg("-hide_banner")
         .arg("-loglevel")
@@ -428,7 +434,7 @@ fn render_media_animation(input: &Path, output_dir: &Path) -> Vec<PathBuf> {
         .arg(input)
         .arg("-vf")
         .arg(format!(
-            "fps={ANIMATED_PREVIEW_FPS},scale=320:240:force_original_aspect_ratio=decrease:flags=lanczos,format=rgba"
+            "fps={framerate_fps},scale=320:240:force_original_aspect_ratio=decrease:flags=lanczos,format=rgba"
         ))
         .arg("-frames:v")
         .arg(ANIMATED_PREVIEW_MAX_FRAMES.to_string())
@@ -502,8 +508,12 @@ fn preview_cache_key(item: &MediaItem, low_memory: bool) -> String {
     )
 }
 
-fn animated_preview_cache_key(item: &MediaItem, low_memory: bool) -> String {
-    format!("{}-anim", preview_cache_key(item, low_memory))
+fn animated_preview_cache_key(item: &MediaItem, low_memory: bool, framerate_fps: u32) -> String {
+    format!(
+        "{}-anim-fps{}",
+        preview_cache_key(item, low_memory),
+        normalized_animation_fps(framerate_fps)
+    )
 }
 
 fn preview_profile_key(low_memory: bool) -> &'static str {
@@ -528,6 +538,13 @@ fn animated_texture_cache_limit(low_memory: bool) -> usize {
     } else {
         ANIMATED_TEXTURE_CACHE_LIMIT
     }
+}
+
+fn normalized_animation_fps(framerate_fps: u32) -> u32 {
+    framerate_fps.clamp(
+        MEDIA_PREVIEW_FRAMERATE_MIN_FPS,
+        MEDIA_PREVIEW_FRAMERATE_MAX_FPS,
+    )
 }
 
 fn thumbnail_scale_filter(low_memory: bool) -> &'static str {
@@ -599,5 +616,36 @@ mod tests {
 
         assert_eq!(preview_cache_key(&item, false), "normal-abc-7-42");
         assert_eq!(preview_cache_key(&item, true), "low-abc-7-42");
+        assert_eq!(
+            animated_preview_cache_key(&item, false, 6),
+            "normal-abc-7-42-anim-fps6"
+        );
+        assert_eq!(
+            animated_preview_cache_key(&item, true, 12),
+            "low-abc-7-42-anim-fps12"
+        );
+    }
+
+    #[test]
+    fn animated_preview_framerate_is_clamped_for_cache_key() {
+        let item = MediaItem {
+            id: "abc".to_owned(),
+            title: "Clip".to_owned(),
+            path: PathBuf::from("/tmp/clip.webm"),
+            kind: crate::media_library::MediaKind::Gif,
+            format: crate::media_library::MediaFormat::Webm,
+            size_bytes: 42,
+            modified_at: 7,
+            search_text: String::new(),
+        };
+
+        assert_eq!(
+            animated_preview_cache_key(&item, false, 0),
+            "normal-abc-7-42-anim-fps1"
+        );
+        assert_eq!(
+            animated_preview_cache_key(&item, false, 120),
+            "normal-abc-7-42-anim-fps24"
+        );
     }
 }

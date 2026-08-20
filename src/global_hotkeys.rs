@@ -23,21 +23,8 @@ pub(crate) struct GlobalHotkeyRuntime {
 impl GlobalHotkeyRuntime {
     pub(crate) fn new(settings: &HotkeySettings, ctx: Context) -> Self {
         let event_rx = spawn_hotkey_event_forwarder(ctx);
-        let manager = match GlobalHotKeyManager::new() {
-            Ok(manager) => Some(manager),
-            Err(err) => {
-                return Self {
-                    manager: None,
-                    registered: Vec::new(),
-                    actions_by_id: HashMap::new(),
-                    event_rx,
-                    status: format!("Global hotkeys unavailable: {err}"),
-                };
-            }
-        };
-
         let mut runtime = Self {
-            manager,
+            manager: None,
             registered: Vec::new(),
             actions_by_id: HashMap::new(),
             event_rx,
@@ -52,14 +39,16 @@ impl GlobalHotkeyRuntime {
         self.actions_by_id.clear();
 
         if !settings.enabled {
-            self.status = "Global hotkeys disabled".to_owned();
+            self.status = "Built-in hotkey backend disabled in Preferences".to_owned();
             return;
         }
 
+        if let Err(err) = self.ensure_manager() {
+            self.status = format!("Built-in hotkeys unavailable: {err}");
+            return;
+        };
         let Some(manager) = &self.manager else {
-            if self.status.is_empty() {
-                self.status = "Global hotkeys unavailable".to_owned();
-            }
+            self.status = "Built-in hotkeys unavailable".to_owned();
             return;
         };
 
@@ -138,6 +127,17 @@ impl GlobalHotkeyRuntime {
         for hotkey in self.registered.drain(..) {
             let _ = manager.unregister(hotkey);
         }
+    }
+
+    fn ensure_manager(&mut self) -> Result<(), String> {
+        if self.manager.is_some() {
+            return Ok(());
+        }
+        GlobalHotKeyManager::new()
+            .map(|manager| {
+                self.manager = Some(manager);
+            })
+            .map_err(|err| err.to_string())
     }
 }
 

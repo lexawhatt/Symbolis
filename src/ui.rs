@@ -19,8 +19,8 @@ use crate::{
     media_library::{MediaFormat, MediaItem, MediaKind},
     media_preview::MediaPreviewCache,
     settings::{
-        HotkeyAction, HotkeyBinding, InterfaceMode, Palette, Preset, Rgb, ThemeSelection,
-        hotkey_key_label,
+        HotkeyAction, HotkeyBinding, InterfaceMode, MEDIA_PREVIEW_FRAMERATE_MAX_FPS,
+        MEDIA_PREVIEW_FRAMERATE_MIN_FPS, Palette, Preset, Rgb, ThemeSelection, hotkey_key_label,
     },
 };
 
@@ -1651,6 +1651,28 @@ impl SymbolisApp {
                                     ui.end_row();
 
                                     ui.label(
+                                        RichText::new("Framerate")
+                                            .size(12.0)
+                                            .color(self.settings.palette.muted.color()),
+                                    );
+                                    manual_changed |= ui
+                                        .add_sized(
+                                            [ui.available_width().min(260.0), 20.0],
+                                            egui::Slider::new(
+                                                &mut self
+                                                    .settings
+                                                    .media_hover_preview
+                                                    .framerate_fps,
+                                                MEDIA_PREVIEW_FRAMERATE_MIN_FPS
+                                                    ..=MEDIA_PREVIEW_FRAMERATE_MAX_FPS,
+                                            )
+                                            .suffix(" fps")
+                                            .show_value(true),
+                                        )
+                                        .changed();
+                                    ui.end_row();
+
+                                    ui.label(
                                         RichText::new("Animation speed")
                                             .size(12.0)
                                             .color(self.settings.palette.muted.color()),
@@ -1676,7 +1698,7 @@ impl SymbolisApp {
                                     &mut self.settings.hotkeys.enabled,
                                     "Enable built-in hotkey backend",
                                 )
-                                .on_hover_text("Optional X11-oriented backend; system launcher shortcut below is preferred on Wayland")
+                                .on_hover_text("Optional desktop-dependent backend. KDE/GNOME/custom desktop shortcuts should use the launcher command below.")
                                 .changed();
                             ui.add_space(8.0);
                             for action in HotkeyAction::CHOICES {
@@ -1698,6 +1720,14 @@ impl SymbolisApp {
                                     .strong()
                                     .color(self.settings.palette.text.color()),
                             );
+                            ui.label(
+                                RichText::new(
+                                    "Recommended for KDE Plasma, GNOME, Ubuntu, Debian, Arch, and other Wayland sessions. This path does not require the built-in backend checkbox.",
+                                )
+                                .size(12.0)
+                                .color(self.settings.palette.muted.color()),
+                            );
+                            ui.add_space(6.0);
                             ui.label(
                                 RichText::new(self.toggle_command_label())
                                     .size(12.0)
@@ -1742,7 +1772,7 @@ impl SymbolisApp {
                                         .fill(self.settings.palette.tile.color()),
                                     )
                                     .on_hover_text(
-                                        "Writes Plasma's kglobalshortcutsrc using the selected global hotkey",
+                                        "Plasma-only convenience action. Works on any distro when kwriteconfig5 or kwriteconfig6 is installed.",
                                     )
                                     .clicked()
                                 {
@@ -2120,15 +2150,7 @@ impl SymbolisApp {
         changed |= hotkeys_changed;
 
         if changed {
-            self.settings.media_hover_preview.delay_ms = self
-                .settings
-                .media_hover_preview
-                .delay_ms
-                .clamp(0.0, 1500.0);
-            self.settings.media_hover_preview.scale =
-                self.settings.media_hover_preview.scale.clamp(1.15, 2.8);
-            self.settings.media_hover_preview.speed =
-                self.settings.media_hover_preview.speed.clamp(0.03, 0.35);
+            self.settings.media_hover_preview.sanitize();
             if theme_changed {
                 self.settings.ensure_editable_theme();
             }
@@ -2958,7 +2980,13 @@ fn draw_media_tile(
                 preview_playback_elapsed
                     .and_then(|elapsed| {
                         app.media_preview_cache
-                            .animated_texture(ui.ctx(), item, elapsed, app.settings.low_memory_mode)
+                            .animated_texture(
+                                ui.ctx(),
+                                item,
+                                elapsed,
+                                app.settings.low_memory_mode,
+                                app.settings.media_hover_preview.normalized_framerate_fps(),
+                            )
                             .cloned()
                     })
                     .unwrap_or_else(|| texture.clone())

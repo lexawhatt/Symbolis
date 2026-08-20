@@ -10,6 +10,7 @@ mod media_drag;
 mod media_library;
 mod media_preview;
 mod media_runtime;
+mod persistence;
 mod preflight;
 mod settings;
 mod telegram_stickers;

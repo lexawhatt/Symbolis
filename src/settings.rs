@@ -9,6 +9,10 @@ use eframe::egui::{
 use serde::{Deserialize, Serialize};
 
 use crate::gif_provider::GifProvider;
+use crate::persistence::write_json_atomic;
+
+pub(crate) const MEDIA_PREVIEW_FRAMERATE_MIN_FPS: u32 = 1;
+pub(crate) const MEDIA_PREVIEW_FRAMERATE_MAX_FPS: u32 = 24;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) enum Preset {
@@ -310,6 +314,8 @@ pub(crate) struct MediaHoverPreviewSettings {
     pub(crate) enabled: bool,
     #[serde(default = "default_media_hover_preview_play_animated")]
     pub(crate) play_animated: bool,
+    #[serde(default = "default_media_hover_preview_framerate_fps")]
+    pub(crate) framerate_fps: u32,
     #[serde(default = "default_media_hover_preview_scale")]
     pub(crate) scale: f32,
     #[serde(default = "default_media_hover_preview_speed")]
@@ -323,10 +329,30 @@ impl Default for MediaHoverPreviewSettings {
         Self {
             enabled: default_media_hover_preview_enabled(),
             play_animated: default_media_hover_preview_play_animated(),
+            framerate_fps: default_media_hover_preview_framerate_fps(),
             scale: default_media_hover_preview_scale(),
             speed: default_media_hover_preview_speed(),
             delay_ms: default_media_hover_preview_delay_ms(),
         }
+    }
+}
+
+impl MediaHoverPreviewSettings {
+    pub(crate) fn sanitize(&mut self) {
+        self.delay_ms = self.delay_ms.clamp(0.0, 1500.0);
+        self.scale = self.scale.clamp(1.15, 2.8);
+        self.speed = self.speed.clamp(0.03, 0.35);
+        self.framerate_fps = self.framerate_fps.clamp(
+            MEDIA_PREVIEW_FRAMERATE_MIN_FPS,
+            MEDIA_PREVIEW_FRAMERATE_MAX_FPS,
+        );
+    }
+
+    pub(crate) fn normalized_framerate_fps(self) -> u32 {
+        self.framerate_fps.clamp(
+            MEDIA_PREVIEW_FRAMERATE_MIN_FPS,
+            MEDIA_PREVIEW_FRAMERATE_MAX_FPS,
+        )
     }
 }
 
@@ -336,6 +362,10 @@ fn default_media_hover_preview_enabled() -> bool {
 
 fn default_media_hover_preview_play_animated() -> bool {
     true
+}
+
+fn default_media_hover_preview_framerate_fps() -> u32 {
+    6
 }
 
 fn default_media_hover_preview_scale() -> f32 {
@@ -598,21 +628,13 @@ pub(crate) fn load_settings(path: &Path) -> Option<UiSettings> {
     } else if !content.contains("\"theme\"") {
         settings.theme = ThemeSelection::Preset(settings.preset);
     }
+    settings.media_hover_preview.sanitize();
 
     Some(settings)
 }
 
 pub(crate) fn save_settings(path: Option<&Path>, settings: &UiSettings) -> io::Result<()> {
-    let Some(path) = path else {
-        return Ok(());
-    };
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let json = serde_json::to_string_pretty(settings)?;
-    fs::write(path, json)
+    write_json_atomic(path, settings)
 }
 
 pub(crate) fn configure_style(ctx: &Context, settings: &UiSettings) {
@@ -942,6 +964,20 @@ mod tests {
         assert_eq!(settings.custom_themes.len(), 1);
         assert_eq!(settings.theme, ThemeSelection::Custom("First".to_owned()));
         assert_eq!(settings.custom_themes[0].name, "First");
+    }
+
+    #[test]
+    fn media_preview_framerate_defaults_for_existing_settings() {
+        let mut value = serde_json::to_value(UiSettings::from_preset(Preset::ModernDark)).unwrap();
+        let preview = value
+            .get_mut("media_hover_preview")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        preview.remove("framerate_fps");
+
+        let settings: UiSettings = serde_json::from_value(value).unwrap();
+
+        assert_eq!(settings.media_hover_preview.framerate_fps, 6);
     }
 
     #[test]

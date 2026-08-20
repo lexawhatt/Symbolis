@@ -1,8 +1,6 @@
 # Symbolis
 
-Symbolis is a Linux desktop symbol and local GIF picker built with Rust and egui. It focuses on fast access to emoji, kaomoji, punctuation, math symbols, language alphabets, box drawing, blocks, shapes, music symbols, and local reaction media.
-
-The app targets Linux desktop sessions first. Text symbols copy to the clipboard; media drag-out support is prepared through an external drag helper.
+Symbolis is a Linux desktop picker for symbols, emoji, kaomoji, local stickers, and local GIF-like media. It is built with Rust and egui, keeps the default workflow offline-first, and is designed around fast clipboard delivery plus optional file drag-out.
 
 ## Run
 
@@ -10,47 +8,29 @@ The app targets Linux desktop sessions first. Text symbols copy to the clipboard
 cargo run
 ```
 
-Symbolis performs startup checks before opening the main UI. Missing core desktop capabilities stop the app with a visible startup error when a GUI session can be opened, and the same message is printed to stderr.
+Symbolis runs startup checks before opening the main UI. Missing core desktop capabilities stop startup with a visible error window when a GUI session is available, and the same message is printed to stderr.
 
-## Required Runtime Capabilities
+## Runtime Requirements
+
+Required:
 
 - Linux desktop session with either `WAYLAND_DISPLAY` or `DISPLAY`.
 - A working system clipboard backend available to `arboard`.
 
-For incoming file drag-and-drop from file managers, Symbolis defaults to X11/XWayland when `DISPLAY` is available, because the current `winit` Linux file-drop implementation is available through its X11 backend. Set `SYMBOLIS_WINDOW_BACKEND=wayland` to force native Wayland, or `SYMBOLIS_WINDOW_BACKEND=x11` to force X11/XWayland.
+Optional:
 
-## Linux Backend Matrix
-
-| Desktop | Recommended mode | Command | Notes |
-| --- | --- | --- | --- |
-| Wayland with XWayland | Auto default | `cargo run` | Best practical default for KDE/GNOME Wayland when `DISPLAY` exists; uses XWayland for more reliable file-manager drops. |
-| Native Wayland | Force Wayland | `SYMBOLIS_WINDOW_BACKEND=wayland cargo run` | Core UI, clipboard, drag-out helper, and media actions work when the compositor exposes clipboard protocols. File drops from file managers may be compositor/toolkit-limited. |
-| X11 | Auto or force X11 | `cargo run` or `SYMBOLIS_WINDOW_BACKEND=x11 cargo run` | Uses the X11 winit backend and X11 clipboard path. |
-
-If both `WAYLAND_DISPLAY` and `DISPLAY` exist, auto mode chooses X11/XWayland intentionally. The System section in Preferences shows the active delivery backend and startup warnings.
-
-## Optional Runtime Capabilities
-
-- `pango-view` for cached color emoji rendering. Without it, Symbolis still runs and falls back to text-rendered emoji.
-- `dragon-drop` or compatible `mwh/dragon` for file drag-out. Without it, Symbolis still runs and keeps clipboard delivery available.
-- `ffmpeg` for GIF/MP4/WebM conversion. Without it, Symbolis can still reference local files, but cannot save optimized WebM copies or export WebM/MP4 back to GIF for transfer.
+- `pango-view` for cached color emoji rendering. Without it, Symbolis falls back to text-rendered emoji.
+- `ffmpeg` for media thumbnails, animated previews, GIF/MP4/WebM conversion, optimized WebM saves, and GIF export for transfer.
+- `dragon-drop` or compatible `mwh/dragon` for file drag-out. Clipboard file delivery still works without it.
 - `curl` for Telegram sticker set imports.
 
-For drag-out, Symbolis checks:
-
-- `SYMBOLIS_DRAG_HELPER=/path/to/dragon`
-- `dragon-drop` in `PATH`
-- compatible `dragon` in `PATH`
-
-## Common Packages
-
-On Arch-based systems, the practical package set usually includes:
+On Arch-based systems:
 
 ```bash
 sudo pacman -S pango noto-fonts noto-fonts-emoji ffmpeg curl xorg-xwayland
 ```
 
-On Debian/Ubuntu-based systems, the practical package set usually includes:
+On Debian/Ubuntu-based systems:
 
 ```bash
 sudo apt install libpango1.0-bin fonts-noto fonts-noto-color-emoji ffmpeg curl xwayland
@@ -58,51 +38,146 @@ sudo apt install libpango1.0-bin fonts-noto fonts-noto-color-emoji ffmpeg curl x
 
 Install `dragon-drop` or `mwh/dragon` separately if your distribution does not package it.
 
-On Wayland desktops, make sure XWayland is installed if you want reliable file drops from file managers into Symbolis. Arch usually packages it as `xorg-xwayland`; Debian/Ubuntu usually package it as `xwayland`.
+## Linux Backends
 
-## Data
+For incoming file drag-and-drop from file managers, Symbolis defaults to X11/XWayland when `DISPLAY` is available, because the current `winit` Linux file-drop path is most reliable through X11.
 
-Symbolis uses local symbol data when available and falls back to a built-in dataset. Recent entries, recent media, UI settings, and the local media index are stored under the user's config/data directories through the `dirs` crate.
+| Desktop | Recommended mode | Command | Notes |
+| --- | --- | --- | --- |
+| Wayland with XWayland | Auto default | `cargo run` | Best practical default for KDE/GNOME Wayland when `DISPLAY` exists. |
+| Native Wayland | Force Wayland | `SYMBOLIS_WINDOW_BACKEND=wayland cargo run` | Core UI, clipboard, drag-out helper, and media actions work when compositor clipboard protocols are available. File drops may depend on compositor/toolkit support. |
+| X11 | Auto or force X11 | `cargo run` or `SYMBOLIS_WINDOW_BACKEND=x11 cargo run` | Uses the X11 winit backend and X11 clipboard path. |
 
-## Local GIFs
+The System section in Preferences shows the active backend, startup warnings, and color emoji renderer status.
 
-The `GIFs` mode is offline-first and does not require paid provider APIs. Symbolis scans:
+## Symbols
+
+Symbolis includes emoji, kaomoji, Greek, Cyrillic, Latin extended, IPA, Hebrew, Arabic, Kana, math, punctuation, currency, arrows, box drawing, blocks, shapes, keyboard symbols, superscripts/subscripts, fractions, Braille, games, music, units, and enclosed symbols.
+
+Text entries copy directly to the clipboard. Recently used symbols are stored as small JSON metadata.
+
+## Local Media
+
+The `GIFs` and `Stickers` modes are offline-first. Symbolis scans:
 
 - `~/.local/share/symbolis/media/gifs`
 - `~/.local/share/symbolis/media/stickers`
 - `~/.local/share/symbolis/media/saved`
 - `~/.local/share/symbolis/media/optimized`
 - common `GIFs` / `Stickers` folders under Pictures
-- paths added in Preferences
+- paths added in Preferences -> Media Sources
 
-Supported local files are `.gif`, `.mp4`, `.m4v`, `.png`, `.webp`, and `.webm`. Drop a supported file onto the app window to store it locally, or add a folder path in Preferences -> Media Sources to reference an existing library without copying it.
+Supported local files are `.gif`, `.mp4`, `.m4v`, `.png`, `.webp`, and `.webm`.
 
-Telegram sticker set links can also be pasted into Preferences -> Media Sources, for example `https://t.me/addstickers/EdgyCatboy`. Telegram import requires a free BotFather token saved in Preferences; `SYMBOLIS_TELEGRAM_BOT_TOKEN` is still supported as an environment override. Symbolis uses Telegram Bot API metadata to download static `.webp` stickers and video `.webm` stickers into `~/.local/share/symbolis/media/stickers/telegram/`. Animated `.tgs` stickers are skipped for now.
+Drop a supported file onto the window to store it locally, or add a folder path in Preferences to reference an existing library without copying it. Folder imports are zero-copy by default: Symbolis stores paths and metadata, then reads the original files from their existing locations.
 
-Clicking a GIF/sticker copies a file-list payload through the system clipboard. Right-clicking a tile exposes explicit file copy, favorite, drag-out, and open-location actions. Drag-out uses `dragon-drop`/`mwh/dragon` when available; without it, file-list clipboard delivery still works.
+The media watcher can automatically reindex watched folders. Content-hash deduplication can collapse identical media during scans.
 
-Favorites and Recently Used are metadata only. They do not duplicate the GIF files.
+Clicking a GIF/sticker copies a file-list payload through the system clipboard. Right-clicking a tile exposes explicit file copy, favorite, drag-out, delete, and open-location actions. Drag-out uses `dragon-drop`/`mwh/dragon` when available.
 
-## Media Storage Model
+Favorites and Recently Used are metadata only. They do not duplicate media files.
 
-Symbolis does not store user GIFs inside the project/repository. The project tree stays source code only. Media storage lives under the user's data directory.
+## Media Preview
 
-Folder imports are zero-copy by default: the app stores paths and metadata in small JSON files, then reads the original files from their existing locations. This avoids doubling disk use for large libraries.
+Media tiles use cached static thumbnails and optional animated hover previews. Preferences -> Media Preview controls:
 
-Individual dropped/saved GIF and MP4 files are stored as WebM under `~/.local/share/symbolis/media/optimized/` using content-addressed names, so identical files deduplicate. When that WebM item is copied or dragged out, Symbolis exports a GIF into `~/.local/share/symbolis/media/exports/` and transfers that GIF. The export cache is regeneratable and is not scanned back into the library.
+- hover zoom on/off
+- animated GIF playback on hover
+- hover delay
+- zoom scale
+- preview framerate from 1 to 24 FPS
+- hover animation speed
 
-The intended long-term storage model is:
+Changing preview framerate creates a separate animated preview cache profile, so old frames are not reused at the wrong FPS.
 
-- referenced local files stay where the user keeps them
-- files explicitly saved from online providers or dropped as GIF/MP4 go into `~/.local/share/symbolis/media/`, preferably as WebM for GIF-like animations
-- saved provider/imported copies use content-addressed names to deduplicate identical files
-- thumbnails/previews are separate cache files and can be regenerated
-- referenced originals are not recompressed by default; optimized saved copies are WebM, with GIF generated only for compatibility on transfer
+## Media Storage
 
-GIPHY and Klipy remain optional configured providers because they require API keys, provider attribution, and provider-specific limits. The default local library path is free for the user and has no provider-side request limits.
+Symbolis does not store user media inside the project repository. User data lives under the platform config/data/cache directories returned by the `dirs` crate.
 
-Provider notes:
+Typical Linux paths:
 
-- Tenor API is not implemented because Google retired developer API integrations on June 30, 2026.
+- settings: `~/.config/symbolis/settings.json`
+- recent symbols: `~/.local/share/symbolis/recent.json`
+- recent media: `~/.local/share/symbolis/recent_media.json`
+- favorite media: `~/.local/share/symbolis/favorite_media.json`
+- media index: `~/.local/share/symbolis/media/index.json`
+- local media: `~/.local/share/symbolis/media/`
+- optimized WebM copies: `~/.local/share/symbolis/media/optimized/`
+- generated transfer exports: `~/.local/share/symbolis/media/exports/`
+- thumbnails/previews: the user cache directory under `symbolis/media-thumbs`
+
+Dropped or saved GIF/MP4 files are stored as content-addressed WebM copies where possible. When a WebM item needs to be copied or dragged as a GIF, Symbolis exports a regeneratable GIF into the exports directory and transfers that file.
+
+JSON persistence uses temp-file plus rename writes for settings, recent symbols, recent media, favorites, and the local media index.
+
+## Telegram Stickers
+
+Telegram sticker set links can be pasted into Preferences -> Media Sources, for example:
+
+```text
+https://t.me/addstickers/EdgyCatboy
+```
+
+Telegram import requires a free BotFather token saved in Preferences. `SYMBOLIS_TELEGRAM_BOT_TOKEN` is also supported as an environment override.
+
+Symbolis uses Telegram Bot API metadata to download static `.webp` stickers and video `.webm` stickers into:
+
+```text
+~/.local/share/symbolis/media/stickers/telegram/
+```
+
+Animated `.tgs` stickers are skipped for now.
+
+## Online Providers
+
+Local media is the default provider and needs no API key.
+
+Optional providers:
+
 - GIPHY requires `SYMBOLIS_GIPHY_API_KEY` and visible `Powered by GIPHY` attribution wherever API results are used.
-- Klipy requires `SYMBOLIS_KLIPY_API_KEY` and visible `Powered by KLIPY` attribution. Klipy's migration guide presents it as a Tenor-compatible endpoint replacement.
+- Klipy requires `SYMBOLIS_KLIPY_API_KEY` and visible `Powered by KLIPY` attribution.
+
+Tenor is not implemented.
+
+## Global Hotkey And IPC
+
+Preferences -> Global Hotkey provides:
+
+- an optional built-in global-hotkey backend
+- a generated launcher command for desktop shortcut managers
+- launcher installation to `~/.local/share/applications/symbolis-toggle.desktop`
+- KDE shortcut application through `kwriteconfig5`/`kwriteconfig6` when available
+
+The desktop-shortcut command is usually the preferred Wayland path. It is distro-neutral: the command is the same on Arch, Debian, Ubuntu, Fedora, and other Linux desktops.
+
+Desktop notes:
+
+- KDE Plasma: use `Apply KDE shortcut` when `kwriteconfig5` or `kwriteconfig6` is available, or install the launcher and bind it in System Settings -> Shortcuts.
+- GNOME/Ubuntu: install the launcher or copy the command, then bind it in Settings -> Keyboard -> View and Customize Shortcuts -> Custom Shortcuts.
+- X11 sessions: the optional built-in backend can also work directly when enabled.
+- Wayland sessions: prefer the desktop shortcut/launcher route because the compositor owns global shortcuts.
+
+The default built-in binding is `Super+Period` for toggling the window when the built-in backend is enabled.
+
+Symbolis also accepts local IPC commands through a Unix socket:
+
+```bash
+symbolis --toggle
+symbolis --show-main
+symbolis --show-symbols
+symbolis --show-stickers
+symbolis --show-gifs
+symbolis --quit
+```
+
+The socket uses `$XDG_RUNTIME_DIR/symbolis.sock` when available. If `XDG_RUNTIME_DIR` is missing, Symbolis creates a private `0700` fallback directory under the system temp directory and rejects symlink or foreign-owned fallback paths.
+
+## Drag-Out Helper
+
+For drag-out, Symbolis checks:
+
+- `SYMBOLIS_DRAG_HELPER=/path/to/dragon`
+- `dragon-drop` in `PATH`
+- compatible `dragon` in `PATH`
+
+Without a helper, media can still be copied through the file-list clipboard path.
