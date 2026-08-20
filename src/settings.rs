@@ -304,6 +304,52 @@ pub(crate) struct Palette {
     pub(crate) danger: Rgb,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub(crate) struct MediaHoverPreviewSettings {
+    #[serde(default = "default_media_hover_preview_enabled")]
+    pub(crate) enabled: bool,
+    #[serde(default = "default_media_hover_preview_play_animated")]
+    pub(crate) play_animated: bool,
+    #[serde(default = "default_media_hover_preview_scale")]
+    pub(crate) scale: f32,
+    #[serde(default = "default_media_hover_preview_speed")]
+    pub(crate) speed: f32,
+    #[serde(default = "default_media_hover_preview_delay_ms")]
+    pub(crate) delay_ms: f32,
+}
+
+impl Default for MediaHoverPreviewSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_media_hover_preview_enabled(),
+            play_animated: default_media_hover_preview_play_animated(),
+            scale: default_media_hover_preview_scale(),
+            speed: default_media_hover_preview_speed(),
+            delay_ms: default_media_hover_preview_delay_ms(),
+        }
+    }
+}
+
+fn default_media_hover_preview_enabled() -> bool {
+    true
+}
+
+fn default_media_hover_preview_play_animated() -> bool {
+    true
+}
+
+fn default_media_hover_preview_scale() -> f32 {
+    1.75
+}
+
+fn default_media_hover_preview_speed() -> f32 {
+    0.12
+}
+
+fn default_media_hover_preview_delay_ms() -> f32 {
+    500.0
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct UiSettings {
     #[serde(default)]
@@ -320,6 +366,10 @@ pub(crate) struct UiSettings {
     pub(crate) theme: ThemeSelection,
     #[serde(default)]
     pub(crate) custom_themes: Vec<CustomTheme>,
+    #[serde(default)]
+    pub(crate) low_memory_mode: bool,
+    #[serde(default)]
+    pub(crate) media_hover_preview: MediaHoverPreviewSettings,
     pub(crate) preset: Preset,
     pub(crate) palette: Palette,
     pub(crate) color_emoji: bool,
@@ -345,6 +395,8 @@ impl UiSettings {
             gif_import_paths: Vec::new(),
             theme: ThemeSelection::Preset(preset),
             custom_themes: Vec::new(),
+            low_memory_mode: false,
+            media_hover_preview: MediaHoverPreviewSettings::default(),
             preset,
             palette: palette_for(preset),
             color_emoji: true,
@@ -364,6 +416,8 @@ impl UiSettings {
         self.gif_provider = previous.gif_provider;
         self.gif_import_paths = previous.gif_import_paths;
         self.custom_themes = previous.custom_themes;
+        self.low_memory_mode = previous.low_memory_mode;
+        self.media_hover_preview = previous.media_hover_preview;
         self.theme = ThemeSelection::Preset(preset);
         self.color_emoji = previous.color_emoji;
         self.tile_height = previous.tile_height;
@@ -628,21 +682,27 @@ pub(crate) fn hotkey_key_label(key: &str) -> &str {
 pub(crate) fn configure_fonts(ctx: &Context, settings: &UiSettings) {
     let mut fonts = FontDefinitions::default();
 
-    let mut font_paths = vec![
+    let mut font_paths = Vec::new();
+    if let Some(base_font) = first_existing_font(&[
         ("NotoSans", "/usr/share/fonts/noto/NotoSans-Regular.ttf"),
         ("DejaVuSans", "/usr/share/fonts/TTF/DejaVuSans.ttf"),
-    ];
+    ]) {
+        font_paths.push(base_font);
+    }
+
+    font_paths.extend([
+        (
+            "NotoSansSymbols2",
+            "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
+        ),
+        (
+            "NotoSansSymbols",
+            "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf",
+        ),
+    ]);
 
     if settings.features.symbols {
         font_paths.extend([
-            (
-                "NotoSansSymbols2",
-                "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
-            ),
-            (
-                "NotoSansSymbols",
-                "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf",
-            ),
             (
                 "NotoSansMath",
                 "/usr/share/fonts/noto/NotoSansMath-Regular.ttf",
@@ -655,11 +715,14 @@ pub(crate) fn configure_fonts(ctx: &Context, settings: &UiSettings) {
                 "NotoSansHebrew",
                 "/usr/share/fonts/noto/NotoSansHebrew-Regular.ttf",
             ),
-            (
+        ]);
+
+        if !settings.low_memory_mode {
+            font_paths.push((
                 "NotoSansCJK",
                 "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-            ),
-        ]);
+            ));
+        }
     }
 
     for (name, path) in font_paths {
@@ -680,6 +743,15 @@ pub(crate) fn configure_fonts(ctx: &Context, settings: &UiSettings) {
     }
 
     ctx.set_fonts(fonts);
+}
+
+fn first_existing_font(
+    fonts: &[(&'static str, &'static str)],
+) -> Option<(&'static str, &'static str)> {
+    fonts
+        .iter()
+        .copied()
+        .find(|(_, path)| Path::new(path).is_file())
 }
 
 fn palette_for(preset: Preset) -> Palette {

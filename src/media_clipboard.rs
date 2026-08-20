@@ -3,16 +3,16 @@ use std::path::{Path, PathBuf};
 use arboard::Clipboard;
 
 pub(crate) struct MediaClipboard {
-    clipboard: Clipboard,
+    clipboard: Option<Clipboard>,
 }
 
 impl MediaClipboard {
-    pub(crate) fn new() -> Result<Self, arboard::Error> {
-        Clipboard::new().map(|clipboard| Self { clipboard })
+    pub(crate) fn new() -> Self {
+        Self { clipboard: None }
     }
 
     pub(crate) fn copy_text(&mut self, text: impl Into<String>) -> Result<(), arboard::Error> {
-        self.clipboard.set_text(text.into())
+        self.clipboard()?.set_text(text.into())
     }
 
     #[allow(dead_code)]
@@ -21,10 +21,21 @@ impl MediaClipboard {
         files: &[PathBuf],
     ) -> Result<(), ClipboardDeliveryError> {
         validate_files(files)?;
-        self.clipboard
+        self.clipboard()
+            .map_err(ClipboardDeliveryError::Clipboard)?
             .set()
             .file_list(files)
             .map_err(ClipboardDeliveryError::Clipboard)
+    }
+
+    fn clipboard(&mut self) -> Result<&mut Clipboard, arboard::Error> {
+        if self.clipboard.is_none() {
+            self.clipboard = Some(Clipboard::new()?);
+        }
+        Ok(self
+            .clipboard
+            .as_mut()
+            .expect("clipboard must be initialized"))
     }
 }
 

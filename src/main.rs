@@ -9,6 +9,7 @@ mod media_clipboard;
 mod media_drag;
 mod media_library;
 mod media_preview;
+mod media_runtime;
 mod preflight;
 mod settings;
 mod telegram_stickers;
@@ -60,15 +61,9 @@ fn main() -> eframe::Result {
 }
 
 fn parse_launch_command() -> Option<IpcCommand> {
-    std::env::args().skip(1).find_map(|arg| match arg.as_str() {
-        "--toggle" => Some(IpcCommand::Toggle),
-        "--show-main" => Some(IpcCommand::ShowMain),
-        "--show-symbols" => Some(IpcCommand::ShowSymbols),
-        "--show-stickers" => Some(IpcCommand::ShowStickers),
-        "--show-gifs" => Some(IpcCommand::ShowGifs),
-        "--quit" => Some(IpcCommand::Quit),
-        _ => None,
-    })
+    std::env::args()
+        .skip(1)
+        .find_map(|arg| IpcCommand::from_arg(&arg))
 }
 
 fn run_startup_error_window(message: String) -> eframe::Result {

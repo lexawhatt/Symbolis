@@ -3,8 +3,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use arboard::Clipboard;
-
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -145,13 +143,6 @@ pub(crate) fn run_startup_preflight() -> Result<PreflightReport, PreflightError>
                 None
             }
         };
-
-        if let Err(err) = Clipboard::new() {
-            failures.push(FailedCheck::new(
-                format!("Clipboard backend is unavailable: {err}"),
-                "Start Symbolis inside a graphical Wayland/X11 session with clipboard access. On minimal Wayland sessions, make sure the compositor supports data-control clipboard protocols.",
-            ));
-        }
 
         let drag_helper = detect_linux_drag_helper().map(Some).unwrap_or_else(|err| {
             warnings.push(StartupWarning::new(

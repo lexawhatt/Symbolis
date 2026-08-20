@@ -13,9 +13,11 @@ use crate::{
     },
     data::{Category, DataSource, EmojiGroup, Entry},
     dev_metrics::{DevMetricsSnapshot, GpuMetric},
+    emoji_cache::EmojiCache,
     gif_provider::{GifProvider, ProviderStatus},
     media_drag::DragOutBackend,
     media_library::{MediaFormat, MediaItem, MediaKind},
+    media_preview::MediaPreviewCache,
     settings::{
         HotkeyAction, HotkeyBinding, InterfaceMode, Palette, Preset, Rgb, ThemeSelection,
         hotkey_key_label,
@@ -34,6 +36,8 @@ const SIDEBAR_STACK_GAP: f32 = 5.0;
 const SIDEBAR_STACK_MAX_VISIBLE_ITEMS: f32 = 2.35;
 const STICKER_PACK_SIDEBAR_MIN_WIDTH: f32 = 620.0;
 const COMPACT_TOPBAR_MAX_WIDTH: f32 = 560.0;
+const STICKER_LIBRARY_ICON: &str = "__symbolis_sticker_library_icon";
+const RECENT_MEDIA_ICON: &str = "__symbolis_recent_media_icon";
 
 #[derive(Clone, Copy)]
 struct Chrome {
@@ -393,7 +397,7 @@ impl SymbolisApp {
                     |ui| {
                         ui.add_space(10.0);
                         let library_icon = if self.content_mode == ContentMode::Stickers {
-                            "▦"
+                            STICKER_LIBRARY_ICON
                         } else {
                             "GIF"
                         };
@@ -401,7 +405,12 @@ impl SymbolisApp {
                         ui.add_space(8.0);
                         self.media_sidebar_button(ui, MediaView::Favorites, "★", true);
                         ui.add_space(8.0);
-                        self.media_sidebar_button(ui, MediaView::RecentlyUsed, "↺", true);
+                        self.media_sidebar_button(
+                            ui,
+                            MediaView::RecentlyUsed,
+                            RECENT_MEDIA_ICON,
+                            true,
+                        );
                     },
                 );
 
@@ -757,7 +766,10 @@ impl SymbolisApp {
 
         let icon_rect = draw_rect.shrink(if is_group { 6.0 } else { 7.0 });
         if emoji_icon && self.settings.color_emoji {
-            if let Some(texture) = self.emoji_cache.texture(ui.ctx(), icon) {
+            if let Some(texture) =
+                self.emoji_cache
+                    .texture(ui.ctx(), icon, self.settings.low_memory_mode)
+            {
                 let image_rect = fit_centered(icon_rect, texture.size_vec2());
                 ui.painter().image(
                     texture.id(),
@@ -783,6 +795,15 @@ impl SymbolisApp {
         is_group: bool,
         opacity: f32,
     ) {
+        if icon == STICKER_LIBRARY_ICON {
+            self.paint_sticker_library_icon(ui, rect, opacity);
+            return;
+        }
+        if icon == RECENT_MEDIA_ICON {
+            self.paint_recent_media_icon(ui, rect, opacity);
+            return;
+        }
+
         let size = if icon == ":-)" {
             13.0
         } else if is_group {
@@ -799,15 +820,56 @@ impl SymbolisApp {
         );
     }
 
+    fn paint_sticker_library_icon(&self, ui: &egui::Ui, rect: Rect, opacity: f32) {
+        let color = fade_color(self.settings.palette.text.color(), opacity);
+        let size = rect.width().min(rect.height()) * 0.54;
+        let top_left = rect.center() - egui::vec2(size * 0.5, size * 0.5);
+        let step = size / 3.0;
+        let gap = step * 0.22;
+        let cell = (step - gap).max(2.0);
+
+        for row in 0..3 {
+            for col in 0..3 {
+                let min = top_left
+                    + egui::vec2(col as f32 * step + gap * 0.5, row as f32 * step + gap * 0.5);
+                ui.painter().rect_filled(
+                    Rect::from_min_size(min, egui::vec2(cell, cell)),
+                    Rounding::same(1.5),
+                    color,
+                );
+            }
+        }
+    }
+
+    fn paint_recent_media_icon(&self, ui: &egui::Ui, rect: Rect, opacity: f32) {
+        let color = fade_color(self.settings.palette.text.color(), opacity);
+        let center = rect.center();
+        let radius = rect.width().min(rect.height()) * 0.27;
+        let stroke = Stroke::new(2.0, color);
+        ui.painter().circle_stroke(center, radius, stroke);
+        ui.painter()
+            .line_segment([center, center + egui::vec2(0.0, -radius * 0.55)], stroke);
+        ui.painter().line_segment(
+            [center, center + egui::vec2(radius * 0.5, radius * 0.28)],
+            stroke,
+        );
+        ui.painter().circle_filled(center, 2.0, color);
+    }
+
     fn draw_topbar(&mut self, ctx: &Context) {
         let chrome = chrome(self.settings.interface_mode);
         let modern = self.settings.interface_mode.is_modern();
         let compact = self.compact_topbar(ctx);
+        let media_actions_height = if self.show_media_selection_actions() {
+            36.0
+        } else {
+            0.0
+        };
         let topbar_height = if compact {
             chrome.topbar_height + 34.0
         } else {
             chrome.topbar_height
-        };
+        } + media_actions_height;
 
         TopBottomPanel::top("top_bar")
             .exact_height(topbar_height)
@@ -822,6 +884,7 @@ impl SymbolisApp {
                 } else {
                     self.draw_full_topbar(ui, modern);
                 }
+                self.draw_media_selection_actions(ui, modern);
                 if modern {
                     let y = ui.max_rect().bottom() - 1.0;
                     ui.painter().line_segment(
@@ -852,7 +915,6 @@ impl SymbolisApp {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(if modern { 16.0 } else { 12.0 });
                 self.draw_topbar_clear_actions(ui, modern);
-
                 if self.app_view == AppView::Main {
                     let width = ui
                         .available_width()
@@ -905,44 +967,58 @@ impl SymbolisApp {
         });
     }
 
-    fn draw_topbar_clear_actions(&mut self, ui: &mut egui::Ui, modern: bool) {
-        if self.app_view == AppView::Main && self.content_mode.media_kind().is_some() {
-            if self.selected_media_count() > 0 {
-                if ui
-                    .button(RichText::new("Clear").color(self.settings.palette.text.color()))
-                    .on_hover_text("Clear media selection")
-                    .clicked()
-                {
-                    self.clear_media_selection();
-                }
-                ui.add_space(if modern { 8.0 } else { 6.0 });
-                if ui
-                    .button(RichText::new("Delete").color(self.settings.palette.danger.color()))
-                    .on_hover_text("Delete selected library media files")
-                    .clicked()
-                {
-                    self.delete_selected_media_files();
-                }
-                ui.add_space(if modern { 8.0 } else { 6.0 });
-                if ui
-                    .button(RichText::new("Unfavorite").color(self.settings.palette.text.color()))
-                    .on_hover_text("Remove selected media from favorites")
-                    .clicked()
-                {
-                    self.remove_selected_media_from_favorites();
-                }
-                ui.add_space(if modern { 8.0 } else { 6.0 });
-                if ui
-                    .button(RichText::new("Favorite").color(self.settings.palette.text.color()))
-                    .on_hover_text("Add selected media to favorites")
-                    .clicked()
-                {
-                    self.add_selected_media_to_favorites();
-                }
-                ui.add_space(if modern { 12.0 } else { 10.0 });
-            }
+    fn show_media_selection_actions(&self) -> bool {
+        self.app_view == AppView::Main
+            && self.content_mode.media_kind().is_some()
+            && self.selected_media_count() > 0
+    }
+
+    fn draw_media_selection_actions(&mut self, ui: &mut egui::Ui, modern: bool) {
+        if !self.show_media_selection_actions() {
+            return;
         }
 
+        ui.add_space(if modern { 6.0 } else { 4.0 });
+        ui.horizontal_wrapped(|ui| {
+            ui.add_space(if modern { 18.0 } else { 14.0 });
+            ui.label(
+                RichText::new(format!("{} selected", self.selected_media_count()))
+                    .size(12.0)
+                    .color(self.settings.palette.muted.color()),
+            );
+            ui.add_space(if modern { 8.0 } else { 6.0 });
+            if ui
+                .button(RichText::new("Favorite").color(self.settings.palette.text.color()))
+                .on_hover_text("Add selected media to favorites")
+                .clicked()
+            {
+                self.add_selected_media_to_favorites();
+            }
+            if ui
+                .button(RichText::new("Unfavorite").color(self.settings.palette.text.color()))
+                .on_hover_text("Remove selected media from favorites")
+                .clicked()
+            {
+                self.remove_selected_media_from_favorites();
+            }
+            if ui
+                .button(RichText::new("Delete").color(self.settings.palette.danger.color()))
+                .on_hover_text("Delete selected library media files")
+                .clicked()
+            {
+                self.delete_selected_media_files();
+            }
+            if ui
+                .button(RichText::new("Clear").color(self.settings.palette.text.color()))
+                .on_hover_text("Clear media selection")
+                .clicked()
+            {
+                self.clear_media_selection();
+            }
+        });
+    }
+
+    fn draw_topbar_clear_actions(&mut self, ui: &mut egui::Ui, modern: bool) {
         if self.app_view == AppView::Main
             && self.content_mode == ContentMode::Symbols
             && self.selected_tab == Tab::Recent
@@ -1168,9 +1244,6 @@ impl SymbolisApp {
                 );
                 ui.add_space(8.0);
                 draw_dev_metrics(ui, palette, &snapshot);
-                ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(8.0);
                 draw_dev_console(ui, self, palette);
                 ui.add_space(12.0);
                 ui.separator();
@@ -1336,6 +1409,7 @@ impl SymbolisApp {
         let mut manual_changed = false;
         let mut theme_changed = false;
         let mut features_changed = false;
+        let mut performance_changed = false;
         let mut hotkeys_changed = false;
 
         ScrollArea::vertical()
@@ -1507,6 +1581,91 @@ impl SymbolisApp {
                                         "Collapse identical files during media library scans",
                                     )
                                     .changed();
+                            });
+                        });
+
+                        ui.add_space(12.0);
+                        settings_panel(ui, "Performance", self.settings.palette, |ui| {
+                            performance_changed |= ui
+                                .checkbox(&mut self.settings.low_memory_mode, "Low memory mode")
+                                .on_hover_text(
+                                    "Use stricter preview caches and skip heavyweight font preload",
+                                )
+                                .changed();
+                        });
+
+                        ui.add_space(12.0);
+                        settings_panel(ui, "Media Preview", self.settings.palette, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                manual_changed |= ui
+                                    .checkbox(
+                                        &mut self.settings.media_hover_preview.enabled,
+                                        "Hover zoom",
+                                    )
+                                    .changed();
+                                manual_changed |= ui
+                                    .checkbox(
+                                        &mut self.settings.media_hover_preview.play_animated,
+                                        "Play GIF on hover",
+                                    )
+                                    .changed();
+                            });
+                            ui.add_space(8.0);
+                            egui::Grid::new("media_preview_settings_grid")
+                                .num_columns(2)
+                                .spacing([12.0, 8.0])
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new("Hover delay")
+                                            .size(12.0)
+                                            .color(self.settings.palette.muted.color()),
+                                    );
+                                    manual_changed |= ui
+                                        .add_sized(
+                                            [ui.available_width().min(260.0), 20.0],
+                                            egui::Slider::new(
+                                                &mut self.settings.media_hover_preview.delay_ms,
+                                                0.0..=1500.0,
+                                            )
+                                            .suffix(" ms")
+                                            .show_value(true),
+                                        )
+                                        .changed();
+                                    ui.end_row();
+
+                                    ui.label(
+                                        RichText::new("Zoom")
+                                            .size(12.0)
+                                            .color(self.settings.palette.muted.color()),
+                                    );
+                                    manual_changed |= ui
+                                        .add_sized(
+                                            [ui.available_width().min(260.0), 20.0],
+                                            egui::Slider::new(
+                                                &mut self.settings.media_hover_preview.scale,
+                                                1.15..=2.8,
+                                            )
+                                            .show_value(true),
+                                        )
+                                        .changed();
+                                    ui.end_row();
+
+                                    ui.label(
+                                        RichText::new("Animation speed")
+                                            .size(12.0)
+                                            .color(self.settings.palette.muted.color()),
+                                    );
+                                    manual_changed |= ui
+                                        .add_sized(
+                                            [ui.available_width().min(260.0), 20.0],
+                                            egui::Slider::new(
+                                                &mut self.settings.media_hover_preview.speed,
+                                                0.03..=0.35,
+                                            )
+                                            .show_value(true),
+                                        )
+                                        .changed();
+                                    ui.end_row();
                             });
                         });
 
@@ -1957,14 +2116,30 @@ impl SymbolisApp {
         changed |= manual_changed;
         changed |= theme_changed;
         changed |= features_changed;
+        changed |= performance_changed;
         changed |= hotkeys_changed;
 
         if changed {
+            self.settings.media_hover_preview.delay_ms = self
+                .settings
+                .media_hover_preview
+                .delay_ms
+                .clamp(0.0, 1500.0);
+            self.settings.media_hover_preview.scale =
+                self.settings.media_hover_preview.scale.clamp(1.15, 2.8);
+            self.settings.media_hover_preview.speed =
+                self.settings.media_hover_preview.speed.clamp(0.03, 0.35);
             if theme_changed {
                 self.settings.ensure_editable_theme();
             }
             if features_changed {
                 self.apply_feature_settings(ctx);
+            } else if performance_changed {
+                crate::settings::configure_fonts(ctx, &self.settings);
+            }
+            if performance_changed {
+                self.emoji_cache = EmojiCache::new(self.emoji_cache.color_renderer_available());
+                self.media_preview_cache = MediaPreviewCache::new();
             }
             if hotkeys_changed {
                 self.rebuild_global_hotkeys();
@@ -2672,14 +2847,31 @@ fn draw_media_tile(
     let chrome = chrome(app.settings.interface_mode);
     let modern = app.settings.interface_mode.is_modern();
     let selected = app.is_media_selected(item);
+    let preview_zoom_enabled =
+        app.settings.media_hover_preview.enabled && !ui.input(|input| input.modifiers.shift);
+    let hover_ready = hover_held_for(
+        ui.ctx(),
+        response.id.with("media_hover_delay"),
+        response.hovered() && preview_zoom_enabled,
+        f64::from(app.settings.media_hover_preview.delay_ms.clamp(0.0, 1500.0)) / 1000.0,
+    );
     let hover_t = ui.ctx().animate_bool(response.id, response.hovered());
+    let preview_hover_t = ui.ctx().animate_bool_with_time(
+        response.id.with("media_tile_preview_zoom"),
+        hover_ready,
+        app.settings.media_hover_preview.speed.clamp(0.03, 0.35),
+    );
+    let preview_playback_elapsed = active_elapsed_seconds(
+        ui.ctx(),
+        response.id.with("media_hover_playback"),
+        hover_ready,
+    );
     let draw_rect = rect.expand(hover_t * if modern { 2.0 } else { 3.0 });
-    let base_fill = if selected {
-        blend_color(palette.tile.color(), palette.accent.color(), 0.22)
-    } else {
-        palette.tile.color()
-    };
-    let fill = blend_color(base_fill, palette.tile_hover.color(), hover_t * 0.72);
+    let fill = blend_color(
+        palette.tile.color(),
+        palette.tile_hover.color(),
+        hover_t * 0.72,
+    );
     let stroke = if selected {
         Stroke::new(
             if response.hovered() { 2.0 } else { 1.5 },
@@ -2702,14 +2894,6 @@ fn draw_media_tile(
         fill,
         stroke,
     );
-    if selected {
-        ui.painter().rect_filled(
-            draw_rect.shrink(4.0),
-            Rounding::same((chrome.tile_rounding - 2.0).max(3.0)),
-            fade_color(palette.accent.color(), 0.10),
-        );
-    }
-
     let select_rect = media_select_rect(rect);
     ui.painter().rect(
         select_rect,
@@ -2755,15 +2939,45 @@ fn draw_media_tile(
             },
         ),
     );
-    if let Some(texture) = app.media_preview_cache.texture(ui.ctx(), item) {
-        let image_rect = fit_centered(preview_rect.shrink(3.0), texture.size_vec2());
-        let image_rect = scale_rect_centered(image_rect, 1.0 + hover_t * 0.08);
+    if let Some(texture) = app
+        .media_preview_cache
+        .texture(ui.ctx(), item, app.settings.low_memory_mode)
+        .cloned()
+    {
+        let image_rect =
+            fit_centered_with_max_scale(preview_rect.shrink(3.0), texture.size_vec2(), 3.0);
+        let image_rect = scale_rect_centered(image_rect, 1.0 + preview_hover_t * 0.05);
         ui.painter().with_clip_rect(preview_rect).image(
             texture.id(),
             image_rect,
             Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             Color32::WHITE,
         );
+        if preview_hover_t > 0.02 {
+            let preview_texture = if app.settings.media_hover_preview.play_animated {
+                preview_playback_elapsed
+                    .and_then(|elapsed| {
+                        app.media_preview_cache
+                            .animated_texture(ui.ctx(), item, elapsed, app.settings.low_memory_mode)
+                            .cloned()
+                    })
+                    .unwrap_or_else(|| texture.clone())
+            } else {
+                texture.clone()
+            };
+            draw_media_hover_preview(
+                ui,
+                MediaHoverPreview {
+                    response: &response,
+                    texture: &preview_texture,
+                    item,
+                    palette,
+                    tile_width: width,
+                    preview_scale: app.settings.media_hover_preview.scale,
+                    hover_t: preview_hover_t,
+                },
+            );
+        }
     } else {
         ui.painter().text(
             preview_rect.center(),
@@ -2814,17 +3028,116 @@ fn draw_media_tile(
         palette.muted.color(),
     );
 
-    let transfer_hint = if matches!(item.format, MediaFormat::Mp4 | MediaFormat::Webm) {
-        "Click exports GIF for clipboard; right-click for drag."
+    response
+}
+
+struct MediaHoverPreview<'a> {
+    response: &'a egui::Response,
+    texture: &'a egui::TextureHandle,
+    item: &'a MediaItem,
+    palette: Palette,
+    tile_width: f32,
+    preview_scale: f32,
+    hover_t: f32,
+}
+
+fn draw_media_hover_preview(ui: &egui::Ui, preview: MediaHoverPreview<'_>) {
+    let MediaHoverPreview {
+        response,
+        texture,
+        item,
+        palette,
+        tile_width,
+        preview_scale,
+        hover_t,
+    } = preview;
+    if hover_t <= 0.02 {
+        return;
+    }
+
+    let screen = ui.ctx().screen_rect();
+    let width = (tile_width * preview_scale.clamp(1.15, 2.8))
+        .clamp(240.0, 320.0)
+        .min((screen.width() - 16.0).max(120.0));
+    let height = if item.kind == MediaKind::Sticker {
+        width.min(260.0)
     } else {
-        "Click copies the file; right-click for drag."
-    };
-    response.on_hover_text(format!(
-        "{}\n{}\n{}",
-        item.title,
-        item.path.display(),
-        transfer_hint,
-    ))
+        (width * 0.62).clamp(150.0, 210.0)
+    }
+    .min((screen.height() - 16.0).max(100.0));
+    let gap = 10.0;
+    let x = (response.rect.center().x - width * 0.5).clamp(
+        screen.left() + 8.0,
+        (screen.right() - width - 8.0).max(screen.left() + 8.0),
+    );
+    let y = if response.rect.top() - height - gap > screen.top() + 8.0 {
+        response.rect.top() - height - gap
+    } else {
+        response.rect.bottom() + gap
+    }
+    .clamp(
+        screen.top() + 8.0,
+        (screen.bottom() - height - 8.0).max(screen.top() + 8.0),
+    );
+    let rect = Rect::from_min_size(egui::pos2(x, y), egui::vec2(width, height));
+    let rect = scale_rect_centered(rect, ease_out_cubic(hover_t));
+    let rounding = Rounding::same(8.0);
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        response.id.with("media_preview_popover"),
+    ));
+
+    painter.rect(
+        rect,
+        rounding,
+        fade_color(
+            blend_color(palette.bg.color(), palette.panel.color(), 0.4),
+            0.94 * hover_t,
+        ),
+        Stroke::new(1.0, fade_color(palette.accent.color(), hover_t)),
+    );
+    let image_rect = fit_centered_with_max_scale(rect.shrink(10.0), texture.size_vec2(), 8.0);
+    painter.with_clip_rect(rect.shrink(4.0)).image(
+        texture.id(),
+        image_rect,
+        Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        fade_color(Color32::WHITE, hover_t),
+    );
+}
+
+fn hover_held_for(ctx: &Context, id: egui::Id, active: bool, delay_seconds: f64) -> bool {
+    if !active {
+        ctx.data_mut(|data| data.remove::<f64>(id));
+        return false;
+    }
+
+    let now = ctx.input(|input| input.time);
+    let started_at = ctx.data_mut(|data| {
+        let started_at = data.get_temp::<f64>(id).unwrap_or(now);
+        data.insert_temp(id, started_at);
+        started_at
+    });
+    if now - started_at < delay_seconds {
+        ctx.request_repaint_after(Duration::from_millis(50));
+        false
+    } else {
+        true
+    }
+}
+
+fn active_elapsed_seconds(ctx: &Context, id: egui::Id, active: bool) -> Option<f64> {
+    if !active {
+        ctx.data_mut(|data| data.remove::<f64>(id));
+        return None;
+    }
+
+    let now = ctx.input(|input| input.time);
+    let started_at = ctx.data_mut(|data| {
+        let started_at = data.get_temp::<f64>(id).unwrap_or(now);
+        data.insert_temp(id, started_at);
+        started_at
+    });
+    Some(now - started_at)
 }
 
 fn media_favorite_rect(rect: Rect) -> Rect {
@@ -2883,7 +3196,10 @@ fn draw_symbol_tile(
     let symbol_rect = symbol_rect(draw_rect, app.settings.interface_mode);
 
     if entry.category == Category::Emoji && app.settings.color_emoji {
-        if let Some(texture) = app.emoji_cache.texture(ui.ctx(), &entry.ch) {
+        if let Some(texture) =
+            app.emoji_cache
+                .texture(ui.ctx(), &entry.ch, app.settings.low_memory_mode)
+        {
             let image_rect = fit_centered(symbol_rect, texture.size_vec2());
             ui.painter().image(
                 texture.id(),
@@ -2967,6 +3283,15 @@ fn label_rect(rect: Rect, mode: InterfaceMode) -> Rect {
 fn fit_centered(bounds: Rect, size: egui::Vec2) -> Rect {
     let max_size = bounds.size();
     let scale = (max_size.x / size.x).min(max_size.y / size.y).min(1.0);
+    let size = size * scale;
+    Rect::from_center_size(bounds.center(), size)
+}
+
+fn fit_centered_with_max_scale(bounds: Rect, size: egui::Vec2, max_scale: f32) -> Rect {
+    let max_size = bounds.size();
+    let scale = (max_size.x / size.x)
+        .min(max_size.y / size.y)
+        .min(max_scale);
     let size = size * scale;
     Rect::from_center_size(bounds.center(), size)
 }

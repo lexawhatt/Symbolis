@@ -282,13 +282,13 @@ pub(crate) struct SymbolisApp {
     pub(crate) media_preview_cache: MediaPreviewCache,
     pub(crate) global_hotkeys: GlobalHotkeyRuntime,
     pub(crate) ipc_server: Option<IpcServer>,
-    media_job_tx: Sender<MediaJobRequest>,
-    media_job_rx: Receiver<MediaJobResult>,
+    media_job_tx: Option<Sender<MediaJobRequest>>,
+    media_job_rx: Option<Receiver<MediaJobResult>>,
     active_media_jobs: usize,
-    media_scan_tx: Sender<MediaScanRequest>,
-    media_scan_rx: Receiver<MediaScanResult>,
-    media_watch_tx: Sender<MediaWatchRequest>,
-    media_watch_rx: Receiver<MediaWatchResult>,
+    media_scan_tx: Option<Sender<MediaScanRequest>>,
+    media_scan_rx: Option<Receiver<MediaScanResult>>,
+    media_watch_tx: Option<Sender<MediaWatchRequest>>,
+    media_watch_rx: Option<Receiver<MediaWatchResult>>,
     active_media_scans: usize,
     media_scan_generation: u64,
     media_scan_completion_status: Option<(u64, String)>,
@@ -319,22 +319,31 @@ impl SymbolisApp {
         } else {
             Vec::new()
         };
+        let media_enabled = settings.features.media_enabled();
         let recent_media_path = recent_media_path();
-        let recent_media = load_recent_media(recent_media_path.as_deref());
+        let recent_media = if media_enabled {
+            load_recent_media(recent_media_path.as_deref())
+        } else {
+            Vec::new()
+        };
         let favorite_media_path = favorite_media_path();
-        let favorite_media_ids = load_favorite_media_ids(favorite_media_path.as_deref());
+        let favorite_media_ids = if media_enabled {
+            load_favorite_media_ids(favorite_media_path.as_deref())
+        } else {
+            Vec::new()
+        };
         let media_index_path = media_index_path();
-        let media_items = load_media_index(media_index_path.as_deref());
+        let media_items = if media_enabled {
+            load_media_index(media_index_path.as_deref())
+        } else {
+            Vec::new()
+        };
         let telegram_bot_token_input = load_saved_telegram_bot_token().unwrap_or_default();
         let telegram_bot_token_saved = !telegram_bot_token_input.is_empty();
         let app_started_at = Instant::now();
         let global_hotkeys = GlobalHotkeyRuntime::new(&settings.hotkeys, cc.egui_ctx.clone());
         let ipc_server = IpcServer::start(cc.egui_ctx.clone()).ok();
-        let (media_job_tx, media_job_rx) = spawn_media_worker();
-        let (media_scan_tx, media_scan_rx) = spawn_media_scan_worker();
-        let (media_watch_tx, media_watch_rx) = spawn_media_watch_worker();
-        let clipboard = MediaClipboard::new()
-            .map_err(|err| format!("Clipboard backend became unavailable: {err}"))?;
+        let clipboard = MediaClipboard::new();
 
         let mut app = Self {
             entries,
@@ -378,13 +387,13 @@ impl SymbolisApp {
             media_preview_cache: MediaPreviewCache::new(),
             global_hotkeys,
             ipc_server,
-            media_job_tx,
-            media_job_rx,
+            media_job_tx: None,
+            media_job_rx: None,
             active_media_jobs: 0,
-            media_scan_tx,
-            media_scan_rx,
-            media_watch_tx,
-            media_watch_rx,
+            media_scan_tx: None,
+            media_scan_rx: None,
+            media_watch_tx: None,
+            media_watch_rx: None,
             active_media_scans: 0,
             media_scan_generation: 0,
             media_scan_completion_status: None,
@@ -395,6 +404,7 @@ impl SymbolisApp {
         if let Some(command) = initial_command {
             app.apply_ipc_command(command, &cc.egui_ctx);
         }
+        trim_process_heap();
         Ok(app)
     }
 
@@ -559,17 +569,60 @@ impl SymbolisApp {
         self.retain_existing_sticker_pack_selection();
     }
 
-    fn update_media_watcher(&mut self) {
-        let request =
-            if self.settings.features.media_watcher && self.settings.features.media_enabled() {
-                MediaWatchRequest::Watch {
-                    paths: media_scan_paths(&self.settings.gif_import_paths),
-                }
-            } else {
-                MediaWatchRequest::Stop
-            };
+    fn ensure_media_job_worker(&mut self) {
+        if self.media_job_tx.is_none() || self.media_job_rx.is_none() {
+            let (media_job_tx, media_job_rx) = spawn_media_worker();
+            self.media_job_tx = Some(media_job_tx);
+            self.media_job_rx = Some(media_job_rx);
+        }
+    }
 
-        if self.media_watch_tx.send(request).is_err() {
+    fn ensure_media_scan_worker(&mut self) {
+        if self.media_scan_tx.is_none() || self.media_scan_rx.is_none() {
+            let (media_scan_tx, media_scan_rx) = spawn_media_scan_worker();
+            self.media_scan_tx = Some(media_scan_tx);
+            self.media_scan_rx = Some(media_scan_rx);
+        }
+    }
+
+    fn stop_media_scan_worker(&mut self) {
+        self.media_scan_tx = None;
+        self.media_scan_rx = None;
+        self.active_media_scans = 0;
+        self.media_scan_completion_status = None;
+    }
+
+    fn ensure_media_watch_worker(&mut self) {
+        if self.media_watch_tx.is_none() || self.media_watch_rx.is_none() {
+            let (media_watch_tx, media_watch_rx) = spawn_media_watch_worker();
+            self.media_watch_tx = Some(media_watch_tx);
+            self.media_watch_rx = Some(media_watch_rx);
+        }
+    }
+
+    fn stop_media_watch_worker(&mut self) {
+        if let Some(media_watch_tx) = self.media_watch_tx.take() {
+            let _ = media_watch_tx.send(MediaWatchRequest::Stop);
+        }
+        self.media_watch_rx = None;
+    }
+
+    fn update_media_watcher(&mut self) {
+        if !(self.settings.features.media_watcher && self.settings.features.media_enabled()) {
+            self.stop_media_watch_worker();
+            return;
+        }
+
+        let request = MediaWatchRequest::Watch {
+            paths: media_scan_paths(&self.settings.gif_import_paths),
+        };
+        self.ensure_media_watch_worker();
+        let sent = self
+            .media_watch_tx
+            .as_ref()
+            .is_some_and(|media_watch_tx| media_watch_tx.send(request).is_ok());
+        if !sent {
+            self.stop_media_watch_worker();
             self.log_dev("media watcher unavailable");
         }
     }
@@ -959,6 +1012,15 @@ impl SymbolisApp {
 
     pub(crate) fn reload_media_library(&mut self) {
         self.update_media_watcher();
+        if !self.settings.features.media_enabled() {
+            self.media_scan_generation = self.media_scan_generation.wrapping_add(1);
+            self.media_items.clear();
+            self.recent_media.clear();
+            self.favorite_media_ids.clear();
+            self.selected_media_ids.clear();
+            self.stop_media_scan_worker();
+            return;
+        }
         self.queue_media_scan("Indexing media library...");
     }
 
@@ -1128,7 +1190,12 @@ impl SymbolisApp {
 
         self.ensure_content_mode_enabled();
         self.retain_enabled_media_state();
-        self.update_media_watcher();
+        if self.settings.features.media_enabled() && self.media_items.is_empty() {
+            self.recent_media = load_recent_media(self.recent_media_path.as_deref());
+            self.favorite_media_ids = load_favorite_media_ids(self.favorite_media_path.as_deref());
+            self.media_items = load_media_index(self.media_index_path.as_deref());
+            self.retain_enabled_media_state();
+        }
         self.reload_media_library();
     }
 
@@ -1434,11 +1501,18 @@ impl SymbolisApp {
     fn queue_media_job(&mut self, job: MediaJobRequest) -> bool {
         let label = media_job_request_label(&job);
         self.log_dev(format!("queue media job: {label}"));
+        self.ensure_media_job_worker();
         self.active_media_jobs += 1;
-        if self.media_job_tx.send(job).is_ok() {
+        let sent = self
+            .media_job_tx
+            .as_ref()
+            .is_some_and(|media_job_tx| media_job_tx.send(job).is_ok());
+        if sent {
             return true;
         }
 
+        self.media_job_tx = None;
+        self.media_job_rx = None;
         self.active_media_jobs = self.active_media_jobs.saturating_sub(1);
         self.status = Some("Media worker is unavailable".to_owned());
         self.log_dev("media worker unavailable; job was not queued");
@@ -1462,8 +1536,13 @@ impl SymbolisApp {
             index_path: self.media_index_path.clone(),
             options: MediaScanOptions::from_features(&self.settings.features),
         };
+        self.ensure_media_scan_worker();
         self.active_media_scans += 1;
-        if self.media_scan_tx.send(request).is_ok() {
+        let sent = self
+            .media_scan_tx
+            .as_ref()
+            .is_some_and(|media_scan_tx| media_scan_tx.send(request).is_ok());
+        if sent {
             self.media_scan_completion_status =
                 completion_status.map(|status| (generation, status));
             self.status = Some(status.into());
@@ -1471,6 +1550,8 @@ impl SymbolisApp {
             return;
         }
 
+        self.media_scan_tx = None;
+        self.media_scan_rx = None;
         self.active_media_scans = self.active_media_scans.saturating_sub(1);
         self.media_scan_completion_status = None;
         self.status = Some("Media scan worker is unavailable".to_owned());
@@ -1478,9 +1559,17 @@ impl SymbolisApp {
     }
 
     fn poll_media_jobs(&mut self) {
+        let Some(media_job_rx) = self.media_job_rx.as_ref() else {
+            return;
+        };
         let mut completed = 0;
+        let mut results = Vec::new();
 
-        while let Ok(result) = self.media_job_rx.try_recv() {
+        while let Ok(result) = media_job_rx.try_recv() {
+            results.push(result);
+        }
+
+        for result in results {
             if media_job_result_is_terminal(&result) {
                 completed += 1;
             }
@@ -1493,9 +1582,17 @@ impl SymbolisApp {
     }
 
     fn poll_media_scans(&mut self) {
+        let Some(media_scan_rx) = self.media_scan_rx.as_ref() else {
+            return;
+        };
         let mut completed = 0;
+        let mut results = Vec::new();
 
-        while let Ok(result) = self.media_scan_rx.try_recv() {
+        while let Ok(result) = media_scan_rx.try_recv() {
+            results.push(result);
+        }
+
+        for result in results {
             completed += 1;
             self.handle_media_scan_result(result);
         }
@@ -1506,8 +1603,11 @@ impl SymbolisApp {
     }
 
     fn poll_media_watcher(&mut self) {
+        let Some(media_watch_rx) = self.media_watch_rx.as_ref() else {
+            return;
+        };
         let mut changed = false;
-        while self.media_watch_rx.try_recv().is_ok() {
+        while media_watch_rx.try_recv().is_ok() {
             changed = true;
         }
 
@@ -1679,6 +1779,7 @@ impl SymbolisApp {
             ));
             format!("Indexed {} media files", self.media_items.len())
         });
+        trim_process_heap();
     }
 
     fn handle_media_job_result(&mut self, result: MediaJobResult) {
@@ -1931,6 +2032,20 @@ fn media_scan_paths(import_paths: &[PathBuf]) -> Vec<PathBuf> {
 fn media_item_enabled(item: &MediaItem, features: &FeatureSettings) -> bool {
     ContentMode::for_media_kind(item.kind).enabled(features)
 }
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn trim_process_heap() {
+    unsafe extern "C" {
+        fn malloc_trim(pad: usize) -> i32;
+    }
+
+    unsafe {
+        let _ = malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn trim_process_heap() {}
 
 fn shell_quote(path: &Path) -> String {
     let value = path.to_string_lossy();

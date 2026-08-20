@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     env, fs,
     io::BufReader,
     path::{Path, PathBuf},
@@ -14,6 +14,9 @@ use std::os::unix::fs::PermissionsExt;
 
 use eframe::egui::{ColorImage, Context, TextureHandle, TextureOptions};
 
+const EMOJI_TEXTURE_CACHE_LIMIT: usize = 128;
+const EMOJI_TEXTURE_CACHE_LIMIT_LOW_MEMORY: usize = 64;
+
 enum CachedEmoji {
     Ready(TextureHandle),
     Failed,
@@ -23,7 +26,12 @@ pub(crate) struct EmojiCache {
     dir: Option<PathBuf>,
     color_renderer_available: bool,
     textures: HashMap<String, CachedEmoji>,
+    texture_order: VecDeque<String>,
     in_flight: HashSet<String>,
+    worker: Option<EmojiWorker>,
+}
+
+struct EmojiWorker {
     job_tx: Sender<EmojiJobRequest>,
     result_rx: Receiver<EmojiJobResult>,
 }
@@ -33,24 +41,31 @@ enum EmojiJobRequest {
         key: String,
         emoji: String,
         output: PathBuf,
+        low_memory: bool,
     },
 }
 
 enum EmojiJobResult {
-    Ready { key: String, path: PathBuf },
-    Failed { key: String },
+    Ready {
+        key: String,
+        path: PathBuf,
+        low_memory: bool,
+    },
+    Failed {
+        key: String,
+        low_memory: bool,
+    },
 }
 
 impl EmojiCache {
     pub(crate) fn new(color_renderer_available: bool) -> Self {
-        let (job_tx, result_rx) = spawn_emoji_worker();
         Self {
             dir: dirs::cache_dir().map(|dir| dir.join("symbolis").join("emoji")),
             color_renderer_available,
             textures: HashMap::new(),
+            texture_order: VecDeque::new(),
             in_flight: HashSet::new(),
-            job_tx,
-            result_rx,
+            worker: None,
         }
     }
 
@@ -58,7 +73,12 @@ impl EmojiCache {
         self.color_renderer_available
     }
 
-    pub(crate) fn texture(&mut self, ctx: &Context, emoji: &str) -> Option<&TextureHandle> {
+    pub(crate) fn texture(
+        &mut self,
+        ctx: &Context,
+        emoji: &str,
+        low_memory: bool,
+    ) -> Option<&TextureHandle> {
         self.drain_completed(ctx);
 
         let key = cache_key(emoji);
@@ -66,8 +86,9 @@ impl EmojiCache {
             if let Some(texture) = self.load_cached_texture(ctx, &key) {
                 self.textures
                     .insert(key.clone(), CachedEmoji::Ready(texture));
+                self.remember_texture_key(&key, low_memory);
             } else {
-                self.queue_render_job(&key, emoji);
+                self.queue_render_job(&key, emoji, low_memory);
             }
         }
 
@@ -82,20 +103,34 @@ impl EmojiCache {
     }
 
     fn drain_completed(&mut self, ctx: &Context) {
+        let Some(worker) = self.worker.as_ref() else {
+            return;
+        };
         let mut updated = false;
+        let mut results = Vec::new();
 
-        while let Ok(result) = self.result_rx.try_recv() {
+        while let Ok(result) = worker.result_rx.try_recv() {
+            results.push(result);
+        }
+
+        for result in results {
             match result {
-                EmojiJobResult::Ready { key, path } => {
+                EmojiJobResult::Ready {
+                    key,
+                    path,
+                    low_memory,
+                } => {
                     self.in_flight.remove(&key);
                     let cached = load_texture(ctx, &key, &path)
                         .map(CachedEmoji::Ready)
                         .unwrap_or(CachedEmoji::Failed);
-                    self.textures.insert(key, cached);
+                    self.textures.insert(key.clone(), cached);
+                    self.remember_texture_key(&key, low_memory);
                 }
-                EmojiJobResult::Failed { key } => {
+                EmojiJobResult::Failed { key, low_memory } => {
                     self.in_flight.remove(&key);
-                    self.textures.insert(key, CachedEmoji::Failed);
+                    self.textures.insert(key.clone(), CachedEmoji::Failed);
+                    self.remember_texture_key(&key, low_memory);
                 }
             }
             updated = true;
@@ -114,18 +149,20 @@ impl EmojiCache {
         load_texture(ctx, key, &path)
     }
 
-    fn queue_render_job(&mut self, key: &str, emoji: &str) {
+    fn queue_render_job(&mut self, key: &str, emoji: &str, low_memory: bool) {
         if self.in_flight.contains(key) {
             return;
         }
 
         if !self.color_renderer_available {
             self.textures.insert(key.to_owned(), CachedEmoji::Failed);
+            self.remember_texture_key(key, low_memory);
             return;
         }
 
         let Some(output) = self.cached_png_path(key) else {
             self.textures.insert(key.to_owned(), CachedEmoji::Failed);
+            self.remember_texture_key(key, low_memory);
             return;
         };
 
@@ -135,10 +172,18 @@ impl EmojiCache {
             key: key.clone(),
             emoji: emoji.to_owned(),
             output,
+            low_memory,
         };
-        if self.job_tx.send(request).is_err() {
+        self.ensure_worker();
+        let sent = self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.job_tx.send(request).is_ok());
+        if !sent {
+            self.worker = None;
             self.in_flight.remove(key.as_str());
-            self.textures.insert(key, CachedEmoji::Failed);
+            self.textures.insert(key.clone(), CachedEmoji::Failed);
+            self.remember_texture_key(&key, low_memory);
         }
     }
 
@@ -146,6 +191,38 @@ impl EmojiCache {
         let dir = self.dir.as_ref()?;
         fs::create_dir_all(dir).ok()?;
         Some(dir.join(format!("{key}.png")))
+    }
+
+    fn remember_texture_key(&mut self, key: &str, low_memory: bool) {
+        if !self.texture_order.iter().any(|existing| existing == key) {
+            self.texture_order.push_back(key.to_owned());
+        }
+
+        while self.textures.len() > emoji_texture_cache_limit(low_memory) {
+            let Some(oldest) = self.texture_order.pop_front() else {
+                break;
+            };
+            if oldest == key && self.textures.len() > 1 {
+                self.texture_order.push_back(oldest);
+                continue;
+            }
+            self.textures.remove(&oldest);
+        }
+    }
+
+    fn ensure_worker(&mut self) {
+        if self.worker.is_none() {
+            let (job_tx, result_rx) = spawn_emoji_worker();
+            self.worker = Some(EmojiWorker { job_tx, result_rx });
+        }
+    }
+}
+
+fn emoji_texture_cache_limit(low_memory: bool) -> usize {
+    if low_memory {
+        EMOJI_TEXTURE_CACHE_LIMIT_LOW_MEMORY
+    } else {
+        EMOJI_TEXTURE_CACHE_LIMIT
     }
 }
 
@@ -166,12 +243,21 @@ fn spawn_emoji_worker() -> (Sender<EmojiJobRequest>, Receiver<EmojiJobResult>) {
 
 fn run_emoji_job(job: EmojiJobRequest) -> EmojiJobResult {
     match job {
-        EmojiJobRequest::Render { key, emoji, output } => {
+        EmojiJobRequest::Render {
+            key,
+            emoji,
+            output,
+            low_memory,
+        } => {
             if render_emoji_png(&emoji, &output) {
-                EmojiJobResult::Ready { key, path: output }
+                EmojiJobResult::Ready {
+                    key,
+                    path: output,
+                    low_memory,
+                }
             } else {
                 let _ = fs::remove_file(output);
-                EmojiJobResult::Failed { key }
+                EmojiJobResult::Failed { key, low_memory }
             }
         }
     }

@@ -96,10 +96,10 @@ impl GlobalHotkeyRuntime {
 
         self.status = if errors.is_empty() {
             if self.registered.is_empty() {
-                "No global hotkeys set".to_owned()
+                "No global hotkey set".to_owned()
             } else {
                 format!(
-                    "Global hotkeys active: {}",
+                    "Global hotkey active: {}",
                     self.registered
                         .iter()
                         .map(|hotkey| hotkey.to_string())
