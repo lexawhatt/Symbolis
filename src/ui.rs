@@ -295,7 +295,73 @@ impl SymbolisApp {
             });
         self.draw_drop_overlay(ctx);
         self.draw_dev_panel(ctx);
+        self.draw_media_rename_window(ctx);
         self.draw_sticker_pack_delete_confirm(ctx);
+    }
+
+    fn draw_media_rename_window(&mut self, ctx: &Context) {
+        let Some(request_snapshot) = self.pending_media_rename.clone() else {
+            return;
+        };
+        let palette = self.settings.palette;
+        let mut open = true;
+        let mut apply = false;
+        let mut cancel = false;
+
+        egui::Window::new(rename_media_window_title(request_snapshot.kind))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_width(340.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(request_snapshot.original_title)
+                        .size(12.0)
+                        .color(palette.muted.color()),
+                );
+                ui.add_space(8.0);
+
+                let Some(request) = self.pending_media_rename.as_mut() else {
+                    return;
+                };
+                let response = ui.add(
+                    TextEdit::singleline(&mut request.name_input)
+                        .desired_width(300.0)
+                        .hint_text("New name"),
+                );
+                if response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
+                    apply = true;
+                }
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            Button::new(RichText::new("Save").color(Color32::WHITE))
+                                .fill(palette.accent.color()),
+                        )
+                        .clicked()
+                    {
+                        apply = true;
+                    }
+                    if ui
+                        .add(
+                            Button::new(RichText::new("Cancel").color(palette.text.color()))
+                                .fill(palette.tile.color()),
+                        )
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if apply {
+            self.apply_pending_media_rename();
+        } else if cancel || !open {
+            self.cancel_rename_media();
+        }
     }
 
     fn draw_sticker_pack_delete_confirm(&mut self, ctx: &Context) {
@@ -2784,6 +2850,15 @@ fn draw_media_grid(ui: &mut egui::Ui, app: &mut SymbolisApp, filtered: &[MediaIt
                                 app.toggle_media_favorite(&item);
                                 ui.close_menu();
                             }
+                            let rename_label = if item.kind == MediaKind::Sticker {
+                                "Rename sticker"
+                            } else {
+                                "Rename GIF"
+                            };
+                            if ui.button(rename_label).clicked() {
+                                app.request_rename_media(&item);
+                                ui.close_menu();
+                            }
                             if ui
                                 .add_enabled(
                                     matches!(item.format, MediaFormat::Gif | MediaFormat::Mp4),
@@ -2854,6 +2929,13 @@ fn media_tile_height(app: &SymbolisApp) -> f32 {
         118.0
     } else {
         104.0
+    }
+}
+
+fn rename_media_window_title(kind: MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Gif => "Rename GIF",
+        MediaKind::Sticker => "Rename sticker",
     }
 }
 

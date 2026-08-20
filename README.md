@@ -73,7 +73,7 @@ Drop a supported file onto the window to store it locally, or add a folder path 
 
 The media watcher can automatically reindex watched folders. Content-hash deduplication can collapse identical media during scans.
 
-Clicking a GIF/sticker copies a file-list payload through the system clipboard. Right-clicking a tile exposes explicit file copy, favorite, drag-out, delete, and open-location actions. Drag-out uses `dragon-drop`/`mwh/dragon` when available.
+Clicking a GIF/sticker copies a file-list payload through the system clipboard. Right-clicking a tile exposes explicit rename, file copy, favorite, drag-out, delete, and open-location actions. Drag-out uses `dragon-drop`/`mwh/dragon` when available.
 
 Favorites and Recently Used are metadata only. They do not duplicate media files.
 

@@ -21,7 +21,7 @@ use crate::{
         MediaFormat, MediaItem, MediaKind, default_media_paths, favorite_media_path,
         is_supported_media_path, load_favorite_media_ids, load_media_index, load_recent_media,
         media_index_path, media_root, normalize_import_path, recent_media_path,
-        save_favorite_media_ids, save_recent_media,
+        save_favorite_media_ids, save_media_index, save_recent_media,
     },
     media_preview::MediaPreviewCache,
     media_runtime::{
@@ -268,6 +268,7 @@ pub(crate) struct SymbolisApp {
     pub(crate) app_started_at: Instant,
     pub(crate) dev_log: VecDeque<DevLogEntry>,
     pub(crate) pending_sticker_pack_delete: Option<StickerPack>,
+    pub(crate) pending_media_rename: Option<MediaRenameRequest>,
     pub(crate) recent_path: Option<PathBuf>,
     pub(crate) recent_media_path: Option<PathBuf>,
     pub(crate) favorite_media_path: Option<PathBuf>,
@@ -293,6 +294,14 @@ pub(crate) struct SymbolisApp {
     active_media_scans: usize,
     media_scan_generation: u64,
     media_scan_completion_status: Option<(u64, String)>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MediaRenameRequest {
+    pub(crate) item_id: String,
+    pub(crate) original_title: String,
+    pub(crate) name_input: String,
+    pub(crate) kind: MediaKind,
 }
 
 impl SymbolisApp {
@@ -373,6 +382,7 @@ impl SymbolisApp {
             app_started_at,
             dev_log: VecDeque::new(),
             pending_sticker_pack_delete: None,
+            pending_media_rename: None,
             recent_path,
             recent_media_path,
             favorite_media_path,
@@ -761,6 +771,140 @@ impl SymbolisApp {
             Err(err) => {
                 self.status = Some(format!("Open location error: {err}"));
             }
+        }
+    }
+
+    pub(crate) fn request_rename_media(&mut self, item: &MediaItem) {
+        self.pending_media_rename = Some(MediaRenameRequest {
+            item_id: item.id.clone(),
+            original_title: item.title.clone(),
+            name_input: item.title.clone(),
+            kind: item.kind,
+        });
+    }
+
+    pub(crate) fn cancel_rename_media(&mut self) {
+        self.pending_media_rename = None;
+    }
+
+    pub(crate) fn apply_pending_media_rename(&mut self) {
+        let Some(request) = self.pending_media_rename.clone() else {
+            return;
+        };
+        let Some(item) = self
+            .media_items
+            .iter()
+            .find(|item| item.id == request.item_id)
+            .or_else(|| {
+                self.recent_media
+                    .iter()
+                    .find(|item| item.id == request.item_id)
+            })
+            .cloned()
+        else {
+            self.pending_media_rename = None;
+            self.status = Some("Media item is no longer available".to_owned());
+            return;
+        };
+
+        let target_path = match media_rename_target_path(&item.path, &request.name_input) {
+            Ok(path) => path,
+            Err(err) => {
+                self.status = Some(format!("Rename {} error: {err}", item.kind.label()));
+                return;
+            }
+        };
+
+        if target_path == item.path {
+            self.pending_media_rename = None;
+            self.status = Some(format!("Rename unchanged: {}", item.title));
+            return;
+        }
+        if target_path.exists() {
+            self.status = Some(format!(
+                "Rename {} error: target already exists",
+                item.kind.label()
+            ));
+            return;
+        }
+
+        if let Err(err) = fs::rename(&item.path, &target_path) {
+            self.status = Some(format!("Rename {} error: {err}", item.kind.label()));
+            return;
+        }
+
+        let new_item = match MediaItem::from_path(&target_path) {
+            Ok(Some(item)) => item,
+            Ok(None) => {
+                self.pending_media_rename = None;
+                self.status = Some("Renamed file is not a supported media file".to_owned());
+                self.queue_media_scan("Renamed media; reindexing media library...");
+                return;
+            }
+            Err(err) => {
+                self.pending_media_rename = None;
+                self.status = Some(format!("Rename metadata error: {err}"));
+                self.queue_media_scan("Renamed media; reindexing media library...");
+                return;
+            }
+        };
+
+        let old_id = item.id.clone();
+        let old_path = item.path.clone();
+        let old_title = item.title.clone();
+        self.replace_renamed_media_item(&old_id, &old_path, new_item.clone());
+
+        let settings_changed = self
+            .settings
+            .gif_import_paths
+            .iter()
+            .any(|path| path == &old_path);
+        if settings_changed {
+            for path in &mut self.settings.gif_import_paths {
+                if path == &old_path {
+                    *path = new_item.path.clone();
+                }
+            }
+            if let Err(err) = save_settings(self.settings_path.as_deref(), &self.settings) {
+                self.status = Some(format!("Settings save error: {err}"));
+                return;
+            }
+        }
+
+        if !self.save_media_metadata() {
+            return;
+        }
+        if let Err(err) = save_media_index(self.media_index_path.as_deref(), &self.media_items) {
+            self.status = Some(format!("Media index save error: {err}"));
+            return;
+        }
+
+        self.pending_media_rename = None;
+        self.content_mode = ContentMode::for_media_kind(new_item.kind);
+        self.queue_media_scan_with_completion(
+            format!("Renamed {old_title}; reindexing media library..."),
+            Some(format!("Renamed {old_title} to {}", new_item.title)),
+        );
+    }
+
+    fn replace_renamed_media_item(&mut self, old_id: &str, old_path: &Path, new_item: MediaItem) {
+        for item in &mut self.media_items {
+            if item.id == old_id || item.path == old_path {
+                *item = new_item.clone();
+            }
+        }
+        for item in &mut self.recent_media {
+            if item.id == old_id || item.path == old_path {
+                *item = new_item.clone();
+            }
+        }
+        for id in &mut self.favorite_media_ids {
+            if id == old_id {
+                *id = new_item.id.clone();
+            }
+        }
+        if self.selected_media_ids.remove(old_id) {
+            self.selected_media_ids.insert(new_item.id.clone());
         }
     }
 
@@ -2100,6 +2244,47 @@ fn restart_kde_global_accel() {
     }
 }
 
+fn media_rename_target_path(path: &Path, name_input: &str) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "media file has no parent directory".to_owned())?;
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .ok_or_else(|| "media file has no extension".to_owned())?;
+    let stem = normalized_media_rename_stem(name_input, extension)?;
+    Ok(parent.join(format!("{stem}.{extension}")))
+}
+
+fn normalized_media_rename_stem(name_input: &str, extension: &str) -> Result<String, String> {
+    let trimmed = name_input.trim();
+    if trimmed.is_empty() {
+        return Err("name cannot be empty".to_owned());
+    }
+    if trimmed
+        .chars()
+        .any(|ch| matches!(ch, '/' | '\\') || ch.is_control())
+    {
+        return Err("name cannot contain path separators or control characters".to_owned());
+    }
+
+    let stem = Path::new(trimmed)
+        .extension()
+        .and_then(|candidate| candidate.to_str())
+        .filter(|candidate| candidate.eq_ignore_ascii_case(extension))
+        .and_then(|_| Path::new(trimmed).file_stem())
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(trimmed)
+        .trim()
+        .trim_matches('.');
+
+    if stem.is_empty() {
+        return Err("name cannot be empty".to_owned());
+    }
+
+    Ok(stem.to_owned())
+}
+
 fn symbolis_data_root() -> Option<PathBuf> {
     dirs::data_dir().map(|dir| dir.join("symbolis"))
 }
@@ -2142,4 +2327,25 @@ fn is_default_media_scan_path(path: &Path) -> bool {
     default_media_paths()
         .iter()
         .any(|default_path| path == default_path || path.starts_with(default_path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_rename_target_keeps_current_extension() {
+        let path = Path::new("/tmp/reaction.gif");
+
+        let target = media_rename_target_path(path, "Better Reaction.gif").unwrap();
+
+        assert_eq!(target, PathBuf::from("/tmp/Better Reaction.gif"));
+    }
+
+    #[test]
+    fn media_rename_target_rejects_unsafe_names() {
+        assert!(normalized_media_rename_stem("", "gif").is_err());
+        assert!(normalized_media_rename_stem("../escape", "gif").is_err());
+        assert!(normalized_media_rename_stem("bad/name", "gif").is_err());
+    }
 }
