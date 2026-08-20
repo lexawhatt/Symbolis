@@ -85,7 +85,7 @@ Media tiles use cached static thumbnails and optional animated hover previews. P
 - animated GIF playback on hover
 - hover delay
 - zoom scale
-- preview framerate from 1 to 24 FPS
+- preview framerate from 1 to 24 FPS without changing source animation speed
 - hover animation speed
 
 Changing preview framerate creates a separate animated preview cache profile, so old frames are not reused at the wrong FPS.

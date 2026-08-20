@@ -20,7 +20,6 @@ const STATIC_TEXTURE_CACHE_LIMIT: usize = 256;
 const STATIC_TEXTURE_CACHE_LIMIT_LOW_MEMORY: usize = 64;
 const ANIMATED_TEXTURE_CACHE_LIMIT: usize = 2;
 const ANIMATED_TEXTURE_CACHE_LIMIT_LOW_MEMORY: usize = 1;
-const ANIMATED_PREVIEW_MAX_FRAMES: usize = 12;
 
 enum CachedMediaPreview {
     Ready(TextureHandle),
@@ -436,8 +435,6 @@ fn render_media_animation(input: &Path, output_dir: &Path, framerate_fps: u32) -
         .arg(format!(
             "fps={framerate_fps},scale=320:240:force_original_aspect_ratio=decrease:flags=lanczos,format=rgba"
         ))
-        .arg("-frames:v")
-        .arg(ANIMATED_PREVIEW_MAX_FRAMES.to_string())
         .arg(output_pattern)
         .status();
 
@@ -510,7 +507,7 @@ fn preview_cache_key(item: &MediaItem, low_memory: bool) -> String {
 
 fn animated_preview_cache_key(item: &MediaItem, low_memory: bool, framerate_fps: u32) -> String {
     format!(
-        "{}-anim-fps{}",
+        "{}-anim-full-fps{}",
         preview_cache_key(item, low_memory),
         normalized_animation_fps(framerate_fps)
     )
@@ -618,11 +615,11 @@ mod tests {
         assert_eq!(preview_cache_key(&item, true), "low-abc-7-42");
         assert_eq!(
             animated_preview_cache_key(&item, false, 6),
-            "normal-abc-7-42-anim-fps6"
+            "normal-abc-7-42-anim-full-fps6"
         );
         assert_eq!(
             animated_preview_cache_key(&item, true, 12),
-            "low-abc-7-42-anim-fps12"
+            "low-abc-7-42-anim-full-fps12"
         );
     }
 
@@ -641,11 +638,11 @@ mod tests {
 
         assert_eq!(
             animated_preview_cache_key(&item, false, 0),
-            "normal-abc-7-42-anim-fps1"
+            "normal-abc-7-42-anim-full-fps1"
         );
         assert_eq!(
             animated_preview_cache_key(&item, false, 120),
-            "normal-abc-7-42-anim-fps24"
+            "normal-abc-7-42-anim-full-fps24"
         );
     }
 }
