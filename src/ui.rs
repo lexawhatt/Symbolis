@@ -330,6 +330,7 @@ impl SymbolisApp {
                         .desired_width(300.0)
                         .hint_text("New name"),
                 );
+                response.request_focus();
                 if response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
                     apply = true;
                 }
@@ -1131,7 +1132,9 @@ impl SymbolisApp {
             [width, if modern { 34.0 } else { 30.0 }],
             TextEdit::singleline(query).hint_text(hint),
         );
-        response.request_focus();
+        if self.pending_media_rename.is_none() {
+            response.request_focus();
+        }
     }
 
     fn draw_compact_sticker_pack_picker(&mut self, ui: &mut egui::Ui) {
